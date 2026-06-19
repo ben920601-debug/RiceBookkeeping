@@ -135,7 +135,14 @@ def is_pure_category_and_amount(user_text: str) -> Optional[List[SingleRecord]]:
 # 🤖 4. AI 核心運算與資料庫同步控制
 # ==========================================
 def analyze_with_gemini_sync(user_text: str) -> SuperRouter:
-    prompt = f"你是一個具備頂級商業敏銳度的記帳助理「飯糰小幫手」。請透視使用者的語意輸入：『{user_text}』進行強型別分流。若提到報表、查帳、統計、看後台等，intent 務必歸為 analyze。若提及還錢、平帳、核銷、誰給誰多少錢，intent 務必歸為 settlement。"
+    prompt = f"""
+    你是一個具備頂級商業敏銳度的記帳助理「飯糰小幫手」。請透視使用者的語意輸入：『{user_text}』進行強型別分流。
+    若提到報表、查帳、統計、看後台等，intent 務必歸為 analyze。
+    若提及還錢、平帳、核銷、誰給誰多少錢，intent 務必歸為 settlement。
+    
+    【核銷特別規則】：
+    如果使用者說「還我 500」、「阿誠 給我 300」，其中的「我」或「給我」代表發話者本人，請在 payer_name 或 receiver_name 直接填入 "發話者" 三個字，讓後端 Python 自動去逆查真實姓名。
+    """
     response = ai_client.models.generate_content(
         model='gemini-2.5-flash', contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.2),
@@ -176,17 +183,41 @@ def save_settlement_from_ai(group_id: str, creator_id: str, settle: SingleSettle
     if db is None or not settle or settle.amount <= 0: 
         return False
     try:
+        # 🚀 獲取發話者的 LINE 真實暱稱
+        creator_name = get_line_user_profile(creator_id)
+        
+        p_name = settle.payer_name.strip()
+        r_name = settle.receiver_name.strip()
+        
+        # 🎯 補位策略 A：如果大腦判定付款人是「我」（發話者），自動帶入發話者暱稱
+        if p_name == "發話者" or not p_name:
+            p_name = creator_name
+            
+        # 🎯 補位策略 B：如果大腦判定收款人是「我」（發話者），自動帶入發話者暱稱
+        if r_name == "發話者" or not r_name:
+            r_name = creator_name
+            
+        # 🎯 防呆防禦：萬一兩個名字被大腦抓成一樣（自言自語），此筆放棄
+        if p_name == r_name:
+            print("⚠️ [SETTLE LOG] 偵測到付款人與收款人相同，取消寫入防止數據污染。", flush=True)
+            return False
+
         group_ref = db.collection("groups").document(group_id)
         if not group_ref.get().exists: 
             group_ref.set({"group_id": group_id, "created_at": datetime.utcnow()})
         
+        # 寫入群組專屬的平帳核銷子集合
         group_ref.collection("settlements").document().set({
-            "payer_name": settle.payer_name.strip(),
-            "receiver_name": settle.receiver_name.strip(),
+            "payer_name": p_name,
+            "receiver_name": r_name,
             "amount": settle.amount,
             "timestamp": datetime.utcnow(),
             "triggered_by_uid": creator_id
         })
+        
+        # 覆寫回結構，方便等一下 LINE 回覆訊息使用正確的真實暱稱
+        settle.payer_name = p_name
+        settle.receiver_name = r_name
         return True
     except Exception as e:
         print(f"❌ 核銷寫入失敗: {e}")
