@@ -299,7 +299,7 @@ def handle_text_message(event):
                         reply_str = f"{summary_text}\n\n🌐 群組專屬財務後台網址：\n{dashboard_url}"
                     else:
                         # 👤 個人模式：維持原樣，不需要帶參數
-                        dashboard_url = f"https://你的前端網頁名稱.onrender.com/index.html"
+                        dashboard_url = f"https://mi-li-ji-zhang-fen-xi.onrender.com"
                         reply_str = f"{summary_text}\n\n🌐 個人專屬雲端帳本：\n{dashboard_url}"
                 elif result.intent == "chat" or result.intent == "sensitive": 
                     reply_str = result.ai_reply
