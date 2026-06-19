@@ -13,7 +13,7 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
-    PushMessageRequest,  # 🚀 改用 Push Message (主動推播) 徹底解決 LINE 5秒逾時斷線
+    PushMessageRequest,  # 🚀 使用背景非同步推播，徹底根除 5 秒逾時
     TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
@@ -31,7 +31,7 @@ load_dotenv()
 app = FastAPI()
 
 # ==========================================
-# ⚙️ 基礎環境變數與客戶端初始化
+# ⚙️ 環境變數與客戶端初始化
 # ==========================================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -40,10 +40,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 🚀 初始化 Gemini 2.5 Flash 付費版大腦 (無設定超時，背景好整以暇慢慢算)
+# 🚀 初始化 Gemini 2.5 Flash 付費版大腦
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 🔥 Firebase Firestore 實體檔案安全性初始化 (讀取 Render Secret File)
+# 🔥 Firebase Firestore 實體檔案安全初始化 (Render Secret File)
 cred_path = "firebase-adminsdk.json"
 if os.path.exists(cred_path):
     try:
@@ -53,13 +53,13 @@ if os.path.exists(cred_path):
         print(f"🔥 [DATABASE LOG] 成功讀取 {cred_path}，Firestore 初始化成功！")
     except Exception as e:
         db = None
-        print(f"❌ [DATABASE LOG] 找到檔案但初始化崩潰: {e}")
+        print(f"❌ [DATABASE LOG] 檔案載入失敗: {e}")
 else:
     db = None
-    print(f"❌ [DATABASE LOG] 嚴重錯誤：在雲端根目錄找不到 {cred_path} 檔案！")
+    print(f"❌ [DATABASE LOG] 嚴重錯誤：根目錄找不到 {cred_path} 檔案！")
 
 # ==========================================
-# 📊 Pydantic 資料結構定義 (強型別約束)
+# 📊 Pydantic 資料結構定義
 # ==========================================
 class SingleRecord(BaseModel):
     record_type: Literal["expense", "income"] = Field(default="expense", description="expense: 支出, income: 收入")
@@ -74,12 +74,12 @@ class SuperRouter(BaseModel):
     ai_reply: Optional[str] = Field(default="", description="回應文字")
 
 # ==========================================
-# ⚡ 智慧分流攔截器 (Token 節流核心)
+# ⚡ 智慧分流攔截器 (本地 Python 節流核心)
 # ==========================================
 
 def is_pure_category_and_amount(user_text: str) -> Optional[List[SingleRecord]]:
     """🚀 前線攔截過濾器：判斷是否『僅有類別/項目 + 金額』
-    如果是，直接在本地用 Python 封裝 records 並回傳，拒絕浪費 Gemini Token！
+    如果是，直接在本地用 Python 封裝 records 並回傳，省下 Gemini Token！
     """
     text_clean = user_text.strip()
     
@@ -92,10 +92,10 @@ def is_pure_category_and_amount(user_text: str) -> Optional[List[SingleRecord]]:
     if any(k in text_clean for k in chat_keywords):
         return None
 
-    # 開始用 Python 正則表達式拆解數字
+    # 用 Python 正則表達式拆解數字
     numbers_find = list(re.finditer(r'\d+', text_clean))
     
-    # 必須剛好只包含一組數字（一筆金額），多了或沒數字都交給 Gemini 處理
+    # 必須剛好只包含一組數字（一筆金額），多了或沒數字都交給 Gemini
     if len(numbers_find) != 1:
         return None
         
@@ -105,33 +105,28 @@ def is_pure_category_and_amount(user_text: str) -> Optional[List[SingleRecord]]:
         start_pos = match.start()
         end_pos = match.end()
         
-        # 拆出數字以外的文字，當作項目與分類
+        # 拆出數字以外的文字
         prev_text = text_clean[:start_pos].strip()
         next_text = text_clean[end_pos:].strip()
         
-        # 清理掉「元」、「塊」等常規單位符號
         clean_prev = re.sub(r'[^\u4e00-\u9fa5a-zA-Z]', '', prev_text)
         clean_next = re.sub(r'[^\u4e00-\u9fa5a-zA-Z]', '', next_text).replace("元", "").replace("塊", "")
         
-        # 決定項目名稱
         item = clean_prev if clean_prev else (clean_next if clean_next else "日常支出")
         
         # 智慧對齊官方 9 大分類
         category = "生活雜費"
         official_categories = ["餐飲食品", "交通運輸", "娛樂休閒", "生活雜費", "服飾美容", "醫療保健", "薪資收入", "投資理財", "其他收入"]
         
-        # 如果使用者輸入的關鍵字有命中官方分類，自動歸類 (例：輸入 "餐飲" -> "餐飲食品")
         for cat in official_categories:
             if cat[:2] in item or item in cat:
                 category = cat
                 break
                 
-        # 判斷是收入還是支出
         r_type = "income" if any(k in item for k in ["薪水", "收入", "中獎", "賺", "薪資"]) else "expense"
         if r_type == "income" and category == "生活雜費":
             category = "薪資收入"
 
-        # 100% 信心度：Python 本地成功攔截並封裝！
         return [SingleRecord(
             record_type=r_type, amount=amount, item=item, category=category, note="⚡ Python 本地極速記帳"
         )]
@@ -160,7 +155,7 @@ def analyze_with_gemini_sync(user_text: str) -> SuperRouter:
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=SuperRouter,
-            temperature=0.3  # 較低的溫度，確保強型別 JSON 輸出精準快速
+            temperature=0.3
         ),
     )
     
@@ -235,46 +230,34 @@ def get_monthly_quick_summary(user_id: str) -> str:
     except Exception: return "⚠️ 查詢速報暫時失敗"
 
 # ==========================================
-# 🌐 Webhook 入口與多執行緒異步調度
-# ==========================================
-PENDING_CONFIRMATIONS = {}
-
-# ==========================================
-# 🌐 Webhook 入口與多執行緒異步調度 (完美修復版)
+# 🌐 Webhook 入口與多執行緒背景調度
 # ==========================================
 PENDING_CONFIRMATIONS = {}
 
 @app.post("/callback")
 async def callback(request: Request, background_tasks: BackgroundTasks):
-    """🚀 修正：入口保持 async def，用標準 await 秒讀 Webhook Body，
-    讀完後立刻打包丟給背景任務 (background_tasks)，0.1秒秒回 LINE 200 OK！
-    """
+    """🚀 入口保持標準 async def，0.1秒內解析並秒回 LINE 200 OK，斷開超時倒數！"""
     signature = request.headers.get("X-Line-Signature")
     if not signature: 
         raise HTTPException(status_code=400, detail="Missing Signature")
     
-    # 🎯 用官方最安全的 await 讀取原始字串，絕不觸發 Status 1 閃退
     body = await request.body()
     body_str = body.decode("utf-8")
     
-    # 💥 丟給 FastAPI 背景執行緒去慢慢算 AI，立刻 return OK 切斷 LINE 的逾時倒數
     background_tasks.add_task(handle_line_events_safe, body_str, signature)
     return "OK"
 
 
 def handle_line_events_safe(body_str: str, signature: str):
-    """這是在獨立的背景執行緒運作，負責驅動 LINE SDK 的解析"""
-    try:
+    try: 
         handler.handle(body_str, signature)
-    except InvalidSignatureError:
+    except InvalidSignatureError: 
         print("❌ LINE 簽章驗證失敗")
-    except Exception as e:
-        print(f"❌ 背景處理 LINE Webhook 時發生錯誤: {e}")
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    """此處運作於背景安全線程，自由調配 Python 攔截與 Gemini 運算，無懼逾時限制"""
+    """運作於背景安全線程，智慧分流、Token 節流核心"""
     user_text = event.message.text.strip()
     user_id = event.source.user_id 
     reply_str = ""
@@ -294,7 +277,6 @@ def handle_text_message(event):
         local_records = is_pure_category_and_amount(user_text)
         
         if local_records:
-            # 🎯 命中純記帳短語：Python 直接入庫直出，不消耗任何 Gemini Token
             print("⚡ [LINE LOG] 偵測到純記帳短語，由 Python 本地直接直出，省下 Token！")
             db_success = save_records_to_db(user_id, local_records)
             if db_success:
@@ -304,7 +286,6 @@ def handle_text_message(event):
                 reply_str = "⚠️ 備份延遲。"
                 
         else:
-            # 🤖 未命中純記帳格式：代表是複雜對話或查詢，調度 Gemini 大腦
             print("🧠 [LINE LOG] 偵測到複雜對話或報表查詢，調度 Gemini 大腦...")
             try:
                 result = analyze_with_gemini_sync(user_text)
@@ -314,8 +295,9 @@ def handle_text_message(event):
                     db_success = save_records_to_db(user_id, result.records)
                     if db_success:
                         lines = [f"{'➕ 收入' if r.record_type == 'income' else '➖ 支出'} ${r.amount} ({r.item})" for r in result.records]
-                        reply_str = "✅ 記帳 success！\n" + "\n".join(lines)
-                    else: reply_str = "⚠️ 備份延遲。"
+                        reply_str = "✅ 記帳成功！\n" + "\n".join(lines)
+                    else: 
+                        reply_str = "⚠️ 備份延遲。"
                 elif result.intent == "chat_with_record" and result.records:
                     PENDING_CONFIRMATIONS[user_id] = result.records
                     reply_str = f"{result.ai_reply}\n\n🔍 偵測到以下可能的花費：\n"
@@ -341,17 +323,6 @@ def handle_text_message(event):
                     reply_str = fallback_result.ai_reply
 
     # 🚀 3. 主動推播 (Push Message) 回傳使用者手機
-    try:
-        with ApiClient(line_config) as api_client:
-            MessagingApi(api_client).push_message(
-                PushMessageRequest(to=user_id, messages=[TextMessage(text=reply_str)])
-            )
-    except Exception as e: 
-        print(f"❌ 主動推播失敗: {e}")       elif result.intent == "analyze": reply_str = get_monthly_quick_summary(user_id)
-        elif result.intent == "chat" or result.intent == "sensitive": reply_str = result.ai_reply
-        else: reply_str = "👌"
-
-    # 🚀 關鍵優化：改用 Push Message 主動推播回使用者的手機上
     try:
         with ApiClient(line_config) as api_client:
             MessagingApi(api_client).push_message(
