@@ -203,6 +203,8 @@ def get_monthly_quick_summary_v2(target_id: str, is_group: bool) -> str:
 # ==========================================
 # 🌐 5. Webhook 入口與多執行緒背景分流調度
 # ==========================================
+PENDING_CONFIRMATIONS = {}
+
 @app.post("/callback")
 async def callback(request: Request, background_tasks: BackgroundTasks):
     signature = request.headers.get("X-Line-Signature")
