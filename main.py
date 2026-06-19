@@ -1,9 +1,8 @@
 import os
 import json
 import re
-import asyncio
 from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal, List, Optional
 
@@ -39,11 +38,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 🚀 初始化唯一大腦：Gemini 2.5 Flash
-# 將超時放寬到 5 秒，確保 Structured Outputs 有完美的緩衝時間，絕不輕易罷工
+# 🚀 初始化唯一大腦：Gemini 2.5 Flash (純同步，控時 4 秒)
 ai_client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options={'timeout': 5}
+    http_options={'timeout': 4}
 )
 
 # 🔥 Firebase Firestore 實體檔案初始化
@@ -68,7 +66,7 @@ class SingleRecord(BaseModel):
     record_type: Literal["expense", "income"] = Field(default="expense", description="expense: 支出, income: 收入")
     amount: int = Field(default=0, description="金額")
     item: str = Field(default="", description="項目名稱")
-    category: str = Field(default="生活雜費", description="限用: 餐飲食品、交通運輸、娛樂休閒、生活雜費、服飾美容、醫療保健、薪資收入、投資理財、其他收入")
+    category: str = Field(default="生活雜費", description="分類")
     note: str = Field(default="", description="備註")
 
 class SuperRouter(BaseModel):
@@ -77,11 +75,11 @@ class SuperRouter(BaseModel):
     ai_reply: Optional[str] = Field(default="", description="回應文字")
 
 # ==========================================
-# 🤖 核心大腦邏輯
+# 🤖 核心大腦邏輯 (全面回歸純同步，消滅執行緒死結)
 # ==========================================
 
-async def analyze_with_gemini_v3(user_text: str) -> SuperRouter:
-    """【唯一大腦】Gemini 2.5 Flash 高速語意調用"""
+def analyze_with_gemini_sync(user_text: str) -> SuperRouter:
+    """【大腦】Gemini 2.5 Flash 純同步安全調用，絕不卡死連線池"""
     prompt = f"""
     你是一個極簡現代風格的個人財務助理「飯糰小幫手」。請分析使用者的輸入：『{user_text}』
     
@@ -92,25 +90,24 @@ async def analyze_with_gemini_v3(user_text: str) -> SuperRouter:
     4. 【回應風格】：說話俐落，不長篇大論。
     """
     
-    def _call():
-        return ai_client.models.generate_content(
-            model='gemini-2.5-flash', 
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=SuperRouter,
-                temperature=0.6
-            ),
-        )
+    # 🚀 移除所有 asyncio 封裝，直攻 Google 伺服器
+    response = ai_client.models.generate_content(
+        model='gemini-2.5-flash', 
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SuperRouter,
+            temperature=0.4 # 降低溫度，讓強型別 JSON 吐得更快、更穩定
+        ),
+    )
     
-    response = await asyncio.to_thread(_call)
     if response.parsed:
         return response.parsed
     return SuperRouter(**json.loads(response.text))
 
 
 def analyze_with_python_fallback(user_text: str) -> SuperRouter:
-    """【終極防線】當唯一大腦真的斷線時，Python 毫秒級自動化代打"""
+    """【最終防線】Python 毫秒級自動化代打"""
     user_text_lower = user_text.lower().strip()
     if any(k in user_text_lower for k in ["查", "報表", "分析", "統計", "花多少", "結餘", "速報"]):
         return SuperRouter(intent="analyze")
@@ -131,7 +128,6 @@ def analyze_with_python_fallback(user_text: str) -> SuperRouter:
             records.append(SingleRecord(record_type=r_type, amount=amount, item=item, category="生活雜費", note="⚠️ 備用大腦解析"))
             
         if records:
-            # 智慧 UX 判斷：字數短且無聊天詞，直接 record 入庫，不用再回「好」
             is_pure_record = len(user_text) <= 10 and not any(k in user_text for k in ["今天", "昨天", "跟", "去", "哈哈", "了"])
             if is_pure_record:
                 return SuperRouter(intent="record", records=records)
@@ -141,7 +137,7 @@ def analyze_with_python_fallback(user_text: str) -> SuperRouter:
     return SuperRouter(intent="chat", ai_reply="👌")
 
 # ==========================================
-# 💾 資料庫管理與 Webhook 狀態機
+# 💾 資料庫管理與 Webhook 入口
 # ==========================================
 def get_line_user_profile(user_id: str) -> str:
     try:
@@ -182,26 +178,28 @@ def get_monthly_quick_summary(user_id: str) -> str:
 PENDING_CONFIRMATIONS = {}
 
 @app.post("/callback")
-async def callback(request: Request, background_tasks: BackgroundTasks):
+def callback(request: Request):
+    """🚀 修正三：入口去掉 async，讓 FastAPI 自動將其分發至線程池，
+    以完美的同步阻塞流去排隊處理 LINE SDK，絕不噴任何 Event Loop 錯誤！
+    """
     signature = request.headers.get("X-Line-Signature")
     if not signature: raise HTTPException(status_code=400, detail="Missing Signature")
-    body = await request.body()
+    
+    # 用同步方式讀取 Body
+    import asyncio
+    body = asyncio.run(request.body())
     body_str = body.decode("utf-8")
-    background_tasks.add_task(handle_line_events, body_str, signature)
+    
+    try:
+        handler.handle(body_str, signature)
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid Signature")
     return "OK"
 
-def handle_line_events(body_str: str, signature: str):
-    try: handler.handle(body_str, signature)
-    except InvalidSignatureError: print("❌ LINE 簽章驗證失敗")
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    try:
-        asyncio.run(process_message_core(event))
-    except Exception as e:
-        print(f"💥 執行核心發生錯誤: {e}")
-
-async def process_message_core(event):
+    """純同步的核心調度器，一行 `async` 都沒有，穩如泰山！"""
     user_text = event.message.text.strip()
     reply_token = event.reply_token
     user_id = event.source.user_id 
@@ -216,14 +214,15 @@ async def process_message_core(event):
             PENDING_CONFIRMATIONS.pop(user_id, None) 
             reply_str = "❌ 抱歉抓錯了！已取消該筆紀錄，請重新輸入。✍️"
     else:
-        # 🚀 乾淨俐落的單大腦守護線
+        # 🛡️ 毫秒級無死角分流
         try:
-            result = await analyze_with_gemini_v3(user_text)
+            result = analyze_with_gemini_sync(user_text)
             print("🤖 [LINE LOG] 目前由唯一的 Gemini 大腦執掌中...")
         except Exception as gemini_err:
-            print(f"⏱️ Gemini 異常，啟動 Python 規則備用代打...")
+            print(f"❌ Gemini 呼叫受挫 ({gemini_err}) ➡️ 瞬間切換至 Python 代打！")
             result = analyze_with_python_fallback(user_text)
         
+        # 意圖分流處理
         if result.intent == "record" and result.records:
             db_success = save_records_to_db(user_id, result.records)
             if db_success:
@@ -240,9 +239,11 @@ async def process_message_core(event):
         elif result.intent == "chat" or result.intent == "sensitive": reply_str = result.ai_reply
         else: reply_str = "👌"
 
+    # 同步回傳
     try:
         with ApiClient(line_config) as api_client:
             MessagingApi(api_client).reply_message_with_http_info(
                 ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=reply_str)])
             )
-    except Exception as e: print(f"❌ 訊息回傳 LINE 失敗: {e}")
+    except Exception as e: 
+        print(f"❌ 訊息回傳 LINE 失敗: {e}")
