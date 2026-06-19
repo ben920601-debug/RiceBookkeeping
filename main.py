@@ -122,14 +122,32 @@ def is_pure_category_and_amount(user_text: str) -> Optional[List[SingleRecord]]:
 # 🤖 4. AI 大腦與【群組級】資料庫儲存邏輯 (核心升級)
 # ==========================================
 def analyze_with_gemini_sync(user_text: str) -> SuperRouter:
-    prompt = f"你是一個極簡現代風格的個人財務助理「飯糰小幫手」。請分析使用者的輸入：『{user_text}』，並精準進行強型別意圖分流。"
+    """【大腦】Gemini 2.5 Flash 純同步強型別調用"""
+    prompt = f"""
+    你是一個極簡現代風格的個人財務助理「飯糰小幫手」。請分析使用者的輸入：『{user_text}』
+    
+    請遵守以下規則：
+    1. 【主動記帳 (record)】：無論是支出還是收入，精準判斷並拆解存入 records 陣列。
+    2. 【對話中提及收支 (chat_with_record)】：聊天時提到賺錢或花錢。在 ai_reply 用「極其精簡、現代溫暖」的一句話詢問是否要記帳。
+    3. 【純聊天 (chat)】：不含收支的日常問候。在 ai_reply 給出高情商且極簡的回應。此時 records 請務必給空陣列 []。
+    4. 【功能代號分析 (analyze)】：若使用者有『報表、查帳、分析、明細、統計』等意圖，請將 intent 歸類為 analyze。
+    5. 【回應風格】：說話俐落，不長篇大論。
+    """
+    
     response = ai_client.models.generate_content(
         model='gemini-2.5-flash', 
         contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.3),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=SuperRouter,
+            temperature=0.3
+        ),
     )
-    if response.parsed: return response.parsed
+    
+    if response.parsed:
+        return response.parsed
     return SuperRouter(**json.loads(response.text))
+
 
 def get_line_user_profile(user_id: str) -> str:
     try:
@@ -137,15 +155,13 @@ def get_line_user_profile(user_id: str) -> str:
             return MessagingApi(api_client).get_profile(user_id).display_name
     except Exception: return "飯糰友"
 
+
 def save_records_to_db_v2(target_id: str, is_group: bool, creator_id: str, records: List[SingleRecord]) -> bool:
-    """🚀 升級版資料庫儲存器：自動相容個人 (users) 與群組 (groups)
-    並在公帳紀錄上打上是誰 (creator_name) 墊付或登錄的，完美防禦數據交叉污染！
-    """
+    """🚀 升級版資料庫儲存器：自動相容個人 (users) 與群組 (groups)"""
     if db is None or not records: return False
     try:
         creator_name = get_line_user_profile(creator_id)
         
-        # 1. 決定 Firestore 根路徑：個人走 users/{userId} ； 群組走 groups/{groupId}
         if is_group:
             base_ref = db.collection("groups").document(target_id)
             if not base_ref.get().exists:
@@ -155,7 +171,6 @@ def save_records_to_db_v2(target_id: str, is_group: bool, creator_id: str, recor
             if not base_ref.get().exists:
                 base_ref.set({"line_user_id": target_id, "display_name": creator_name, "created_at": datetime.utcnow()})
         
-        # 2. 封裝 Batch 統一寫入內嵌的 expenses 副集合
         batch = db.batch()
         for rec in records:
             if rec.amount <= 0: continue
@@ -168,8 +183,8 @@ def save_records_to_db_v2(target_id: str, is_group: bool, creator_id: str, recor
                 "category": rec.category,
                 "note": rec.note,
                 "timestamp": datetime.utcnow(),
-                "created_by_uid": creator_id,      # 🎯 核心安全：紀錄誰付錢的 UID
-                "created_by_name": creator_name    # 🎯 核心安全：紀錄誰付錢的名字
+                "created_by_uid": creator_id,      
+                "created_by_name": creator_name    
             }
             batch.set(doc_ref, payload)
             
@@ -179,6 +194,7 @@ def save_records_to_db_v2(target_id: str, is_group: bool, creator_id: str, recor
     except Exception as e:
         print(f"💥 [DATABASE LOG] 寫入失敗: {e}", flush=True)
         return False
+
 
 def get_monthly_quick_summary_v2(target_id: str, is_group: bool) -> str:
     if db is None: return "📴 資料庫維護中"
@@ -195,8 +211,9 @@ def get_monthly_quick_summary_v2(target_id: str, is_group: bool) -> str:
             else: expense_total += amt
             
         title = "📊 本月群組公帳速報" if is_group else "📊 本月個人極簡速報"
-        return f"{title}\n📈 總收入：${income_total}\n📉 總支出：${expense_total}\n💰 淨結餘：${income_total - expense_total}\n\n🌐 詳細明細請至 Web 後台查看。"
+        return f"{title}\n📈 總收入：${income_total:,}\n📉 總支出：${expense_total:,}\n💰 淨結餘：${(income_total - expense_total):,}"
     except Exception: return "⚠️ 查詢速報暫時失敗"
+
 
 # ==========================================
 # 🌐 5. Webhook 入口與多執行緒背景分流調度
@@ -211,7 +228,7 @@ async def callback(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     body_str = body.decode("utf-8")
     
-    # 🕵️ 【安全防禦攔截 A】新手指南精準字串 -> Webhook 直接斷開沉默，移交 LINE 官方 CDN 自動回覆接管
+    # 🕵️ 【安全防禦攔截 A】
     if body_str and '"text":"請教導我該如何使用？"' in body_str:
         return Response(content="OK", status_code=200)
     
@@ -222,23 +239,23 @@ def handle_line_events_safe(body_str: str, signature: str):
     try: handler.handle(body_str, signature)
     except InvalidSignatureError: print("❌ LINE 簽章驗證失敗")
 
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
     user_text = event.message.text.strip()
-    creator_id = event.source.user_id # 👤 訊息發送者 (不論在哪都是真實個人)
+    creator_id = event.source.user_id 
     
-    # 🕵️ 辨識來源是「單人聊天室」還是「群組聊天室」
     source_type = event.source.type  
     if source_type == "group":
-        target_id = event.source.group_id # 🎯 群組公帳主鍵
+        target_id = event.source.group_id 
         is_group = True
     else:
-        target_id = creator_id             # 👤 個人帳本主鍵
+        target_id = creator_id             
         is_group = False
 
     reply_str = ""
     
-    # 【安全防禦攔截 B】敏感話題過濾 -> Python 端秒阻斷，不送 Gemini
+    # 【安全防禦攔截 B】敏感話題過濾
     for kw in SENSITIVE_KEYWORDS:
         if kw in user_text:
             reply_str = "🤖 飯糰小幫手是專屬的財務助理，無法聊政治或非財務相關的話題喔！"
@@ -272,7 +289,7 @@ def handle_text_message(event):
             else: reply_str = "⚠️ 備份延遲。"
                 
         else:
-            # 🤖 未命中純記帳格式：代表是複雜對話或查詢，調度 Gemini 付費版大腦
+            # 🤖 未命中純記帳格式：調度 Gemini 大腦
             try:
                 result = analyze_with_gemini_sync(user_text)
                 
@@ -290,29 +307,29 @@ def handle_text_message(event):
                     for rec in result.records:
                         reply_str += f"・[{'收入' if rec.record_type == 'income' else '支出'}] ${rec.amount} 元 的 {rec.item}\n"
                     reply_str += "\n👉 正確請回覆「好」，若錯誤請回覆任意文字取消。"
-                
-                    elif result.intent == "analyze": 
-                        summary_text = get_monthly_quick_summary_v2(target_id, is_group)
+                    
+                # 🛡️ 3. 報表查詢：全面導入官方安全跳轉路由 `liff.line.me` 機制
+                elif result.intent == "analyze": 
+                    summary_text = get_monthly_quick_summary_v2(target_id, is_group)
+                    
+                    if is_group:
+                        # 👥 群組公帳：拼接 ?groupId= 參數，強迫呼叫 LINE 內建 In-App 安全瀏覽器
+                        dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}?groupId={target_id}"
+                        reply_str = f"{summary_text}\n\n🌐 群組專屬財務後台網址：\n{dashboard_url}"
+                    else:
+                        # 👤 個人私帳：使用官方安全短網址跳轉
+                        dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}"
+                        reply_str = f"{summary_text}\n\n🌐 個人專屬雲端帳本：\n{dashboard_url}"
                         
-                        # 🎯 1. 填入你在 LINE Developers 後台看到的完整 LIFF ID (例: "2001234567-abcde123")
-                        MY_LIFF_ID = "YOUR_LIFF_ID_HERE" 
-                        
-                        if is_group:
-                            # 👥 群組模式：改用 LINE 官方標準二次跳轉路徑，確保 100% 在 LINE 內嵌瀏覽器安全開啟
-                            dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}?groupId={target_id}"
-                            reply_str = f"{summary_text}\n\n🌐 群組專屬財務後台網址：\n{dashboard_url}"
-                        else:
-                            # 👤 個人模式：同樣改用官方安全網址
-                            dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}"
-                            reply_str = f"{summary_text}\n\n🌐 個人專屬雲端帳本：\n{dashboard_url}"
-                                elif result.intent == "chat" or result.intent == "sensitive": 
-                                reply_str = result.ai_reply
-                            else: reply_str = "👌"
-                                
-                        except Exception:
-                            reply_str = "🤖 飯糰大腦連線稍微波動，請稍後再試。"
+                elif result.intent == "chat" or result.intent == "sensitive": 
+                    reply_str = result.ai_reply
+                else: reply_str = "👌"
+                    
+            except Exception as e:
+                print(f"❌ Gemini 大腦處理崩潰: {e}", flush=True)
+                reply_str = "🤖 飯糰大腦連線稍微波動，請稍後再試。"
 
-    # 🚀 3. 推播回傳（注意：群組內要推給群組 target_id；個人推給個人）
+    # 🚀 4. 非同步強推推播
     try:
         with ApiClient(line_config) as api_client:
             MessagingApi(api_client).push_message(
@@ -320,6 +337,7 @@ def handle_text_message(event):
             )
     except Exception as e: print(f"❌ 推播失敗: {e}")
 
+
 @app.get("/")
 def health_check():
-    return {"status": "healthy", "version": "v2.5 Group-SaaS 完全體"}
+    return {"status": "healthy", "version": "v2.6 LIFF-Redirect 完全體"}
