@@ -290,21 +290,22 @@ def handle_text_message(event):
                     for rec in result.records:
                         reply_str += f"・[{'收入' if rec.record_type == 'income' else '支出'}] ${rec.amount} 元 的 {rec.item}\n"
                     reply_str += "\n👉 正確請回覆「好」，若錯誤請回覆任意文字取消。"
+                
                     elif result.intent == "analyze": 
                         summary_text = get_monthly_quick_summary_v2(target_id, is_group)
                         
-                        # 🎯 這裡輸入你剛上線的全新 Render 後台網址！
-                        base_dashboard_url = "https://mi-li-ji-zhang-fen-xi.onrender.com"
+                        # 🎯 1. 填入你在 LINE Developers 後台看到的完整 LIFF ID (例: "2001234567-abcde123")
+                        MY_LIFF_ID = "YOUR_LIFF_ID_HERE" 
                         
                         if is_group:
-                            # 👥 群組模式：自動拼接 ?groupId= 參數，實現多人公帳隔離
-                            dashboard_url = f"{base_dashboard_url}?groupId={target_id}"
+                            # 👥 群組模式：改用 LINE 官方標準二次跳轉路徑，確保 100% 在 LINE 內嵌瀏覽器安全開啟
+                            dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}?groupId={target_id}"
                             reply_str = f"{summary_text}\n\n🌐 群組專屬財務後台網址：\n{dashboard_url}"
                         else:
-                            # 👤 個人模式：直接給原網址
-                            dashboard_url = base_dashboard_url
+                            # 👤 個人模式：同樣改用官方安全網址
+                            dashboard_url = f"https://liff.line.me/{MY_LIFF_ID}"
                             reply_str = f"{summary_text}\n\n🌐 個人專屬雲端帳本：\n{dashboard_url}"
-                            elif result.intent == "chat" or result.intent == "sensitive": 
+                                elif result.intent == "chat" or result.intent == "sensitive": 
                                 reply_str = result.ai_reply
                             else: reply_str = "👌"
                                 
