@@ -295,7 +295,7 @@ def handle_text_message(event):
                     
                     if is_group:
                         # 👥 群組模式：自動將目前對話的 target_id (也就是 groupId) 當成參數拼接上去
-                        dashboard_url = f"https://你的前端網頁名稱.onrender.com/index.html?groupId={target_id}"
+                        dashboard_url = f"https://mi-li-ji-zhang-fen-xi.onrender.com/index.html?groupId={target_id}"
                         reply_str = f"{summary_text}\n\n🌐 群組專屬財務後台網址：\n{dashboard_url}"
                     else:
                         # 👤 個人模式：維持原樣，不需要帶參數
