@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="記帳米粒 ｜ 旗艦核銷與代點單版")
+app = FastAPI(title="記帳米粒 ｜ 俐落點單與智慧結單版")
 
 # ==========================================
 # ⚙️ 1. 核心客戶端與資料庫初始化
@@ -214,14 +214,12 @@ def handle_text_message(event):
             settle_amount = int(amount_match.group()) if amount_match else 0
             if settle_amount <= 0: return
 
-            # 抓取 Tag，包含自己
             tagged_user_ids = []
             if mention and mention.mentionees:
                 for m in mention.mentionees:
                     u_id = getattr(m, "user_id", None)
                     if u_id: tagged_user_ids.append(u_id)
 
-            # 判斷核銷對象 (雙人、單人、或是完全沒 Tag 的自行核銷)
             if len(tagged_user_ids) >= 2:
                 final_payer_id = tagged_user_ids[0]
                 final_receiver_id = tagged_user_ids[1]
@@ -229,7 +227,6 @@ def handle_text_message(event):
                 final_payer_id = tagged_user_ids[0]
                 final_receiver_id = creator_id
             else:
-                # 沒 Tag 任何人，觸發「自行核銷」
                 final_payer_id = creator_id
                 final_receiver_id = creator_id
                 
@@ -239,7 +236,6 @@ def handle_text_message(event):
                 for doc_obj in order_query: current_order = doc_obj.to_dict(); break
                 if not current_order: return
                 
-                # 計算賸餘欠款
                 payer_expected_total = sum(item.get("price", 0) for item in current_order.get("items", []) if item.get("buyer_id") == final_payer_id or item.get("buyer") == final_payer_id)
                 history_settles = db.collection("groups").document(target_id).collection("settlements").where("order_code_ref", "==", active_code).where("payer_id", "==", final_payer_id).stream()
                 payer_already_paid = sum(doc_obj.to_dict().get("amount", 0) for doc_obj in history_settles)
@@ -261,7 +257,6 @@ def handle_text_message(event):
                     "amount": settle_amount, "order_code_ref": active_code, "timestamp": datetime.utcnow()
                 })
 
-                # 自行核銷與互相核銷的專屬回覆
                 if final_payer_id == final_receiver_id:
                     send_line_reply(reply_token, f"✅ 【單號 #{active_code} 核銷成功】\n🙋‍♂️ 自行核銷：{payer_name_str}\n💰 紀錄金額：${settle_amount}")
                 else:
@@ -287,7 +282,7 @@ def handle_text_message(event):
             "👉 啟動：『@記帳米粒 開團』\n"
             "👉 自己點：『@記帳米粒 雞排 100』\n"
             "👉 幫人點：『@記帳米粒 @小明 珍奶 50』\n"
-            "👉 結單：『@記帳米粒 結單 #單號』\n\n"
+            "👉 結單：『@記帳米粒 結單』\n\n"
             "💳 「核銷模式：防呆平帳」：\n"
             "👉 啟動：『@記帳米粒 申請核銷 #單號』\n"
             "👉 代收：『@記帳米粒 @小明 給我 100』\n"
@@ -310,7 +305,6 @@ def handle_text_message(event):
         raw_item_name = fast_match.group(1).strip()
         amount = int(fast_match.group(2))
         
-        # 清除品名中的 Tag 字元
         item_name = re.sub(r'@\S+', '', raw_item_name).strip()
         
         if not item_name.isdigit() and amount > 0:
@@ -324,7 +318,6 @@ def handle_text_message(event):
                 return
                 
             elif current_mode == "order" and is_group:
-                # 🚀 代點單核心邏輯：偵測到 Tag 則算在 Tag 頭上
                 tagged_user_ids = []
                 if mention and mention.mentionees:
                     for m in mention.mentionees:
@@ -341,7 +334,8 @@ def handle_text_message(event):
                     "item": item_name, "price": amount, "timestamp": datetime.utcnow().isoformat()
                 })
                 g_ref.update({"order_items_temp": temp_items})
-                send_line_reply(reply_token, f"📝 已幫 {actual_buyer_name} 點單：{item_name} ${amount}")
+                # 🎯 修改：俐落回覆，不帶人名
+                send_line_reply(reply_token, f"📝 已接單：{item_name} ${amount}")
                 return
 
     # ====================================================
@@ -390,7 +384,6 @@ def handle_text_message(event):
                 g_ref = db.collection("groups").document(target_id)
                 temp_items = g_ref.get().to_dict().get("order_items_temp", [])
                 
-                # Tag 代點單邏輯
                 tagged_user_ids = []
                 if mention and mention.mentionees:
                     for m in mention.mentionees:
@@ -399,27 +392,26 @@ def handle_text_message(event):
                 actual_buyer_id = tagged_user_ids[0] if tagged_user_ids else creator_id
                 actual_buyer_name = resolve_id_to_name(target_id, actual_buyer_id)
                 
+                reply_lines = []
                 for item in result.order_items:
                     clean_item_name = re.sub(r'@\S+', '', item.item_name).strip()
                     temp_items.append({
                         "buyer_id": actual_buyer_id, "buyer": actual_buyer_name,
                         "item": clean_item_name, "price": item.price, "timestamp": datetime.utcnow().isoformat()
                     })
+                    # 🎯 修改：俐落回覆，不帶人名
+                    reply_lines.append(f"📝 已接單：{clean_item_name} ${item.price}")
+                    
                 g_ref.update({"order_items_temp": temp_items})
-                reply_text = result.ai_reply if result.ai_reply else f"📝 已幫 {actual_buyer_name} 掛載點單。"
-                send_line_reply(reply_token, f"🤖 {reply_text}")
+                send_line_reply(reply_token, "\n".join(reply_lines))
 
-        # 4. 截止結單 (強制校驗單號防呆)
+        # 4. 截止結單 (🎯 修改：移除強制校驗單號防呆，智慧結單)
         elif result.intent == "order_end" and current_mode == "order" and is_group:
             g_ref = db.collection("groups").document(target_id)
             g_data = g_ref.get().to_dict()
             active_code = g_data.get("active_order_code", "")
-            
-            if active_code and f"#{active_code}" not in user_text and active_code not in user_text:
-                send_line_reply(reply_token, f"⚠️ 結單失敗！請提供正確單號以結束團購。\n👉 範例：『@記帳米粒 結單 #{active_code}』")
-                return
-            
             temp_items = g_data.get("order_items_temp", [])
+            
             if temp_items:
                 total_amt = sum(i["price"] for i in temp_items)
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
@@ -444,4 +436,4 @@ def handle_text_message(event):
 
 @app.get("/")
 def health_check(): 
-    return {"status": "fast_regex_active", "version": "v10.0-Ultimate-SaaS"}
+    return {"status": "fast_regex_active", "version": "v10.1-Ultimate-SaaS"}
