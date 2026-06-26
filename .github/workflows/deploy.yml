@@ -11,7 +11,9 @@ jobs:
     steps:
       - name: Deploy via Local Sync
         run: |
-          # 因為 Runner 已經在你的伺服器內，直接進目錄同步即可
           cd /home/buddy/ricebookkeeping
+          # 強制清理所有未追蹤檔案，確保環境乾淨
+          git clean -fd
+          # 強制拉取遠端最新分支並重置
           git fetch origin main
           git reset --hard origin/main
