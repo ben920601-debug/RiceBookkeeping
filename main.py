@@ -31,10 +31,6 @@ from pymysql.cursors import DictCursor
 
 from dotenv import load_dotenv
 
-import certifi
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
 load_dotenv()
 
 app = FastAPI(title="記帳米粒 ｜ V1.2 MySQL 版")
@@ -649,6 +645,235 @@ def handle_text_message(event):
 def health_check(): 
     return {"status": "mysql_active", "version": "v1.2-MySQL"}
 
+# ==========================================
+# 🖥️ 5. 監控後台 REST API（供 index.html 呼叫，取代原本直連 Firestore 的寫法）
+# ==========================================
+class ExpenseUpdate(BaseModel):
+    item: str
+    amount: int
+
+class GroupStateUpdate(BaseModel):
+    state: Literal["normal", "order", "settle"]
+
+class OrderItemUpdate(BaseModel):
+    buyer_name: str
+    item_name: str
+    price: int
+
+
+def _require_db():
+    if not DB_READY:
+        raise HTTPException(status_code=503, detail="資料庫尚未就緒")
+
+
+@app.get("/api/expenses")
+def api_list_expenses(
+    owner_type: Literal["user", "group"],
+    owner_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    record_type: Optional[str] = None,
+):
+    """個人/群組首頁流水帳、進階查詢共用：依日期區間、收支類型篩選"""
+    _require_db()
+    sql = "SELECT id, record_type, amount, item, category, created_by_name, created_at FROM expenses WHERE owner_type=%s AND owner_id=%s"
+    params = [owner_type, owner_id]
+    if start:
+        sql += " AND created_at >= %s"
+        params.append(f"{start} 00:00:00")
+    if end:
+        sql += " AND created_at <= %s"
+        params.append(f"{end} 23:59:59")
+    if record_type and record_type != "all":
+        sql += " AND record_type = %s"
+        params.append(record_type)
+    sql += " ORDER BY created_at DESC"
+    try:
+        with db_cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        for r in rows:
+            r["created_at"] = r["created_at"].isoformat()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/expenses/{expense_id}")
+def api_update_expense(expense_id: int, body: ExpenseUpdate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "UPDATE expenses SET item=%s, amount=%s WHERE id=%s",
+                (body.item, body.amount, expense_id)
+            )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/expenses/{expense_id}")
+def api_delete_expense(expense_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM expenses WHERE id=%s", (expense_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/groups/{group_id}")
+def api_get_group(group_id: str):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT group_id, state, active_order_code FROM `groups` WHERE group_id=%s", (group_id,))
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="找不到此群組")
+        return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/groups/{group_id}/state")
+def api_update_group_state(group_id: str, body: GroupStateUpdate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("UPDATE `groups` SET state=%s WHERE group_id=%s", (body.state, group_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/groups/{group_id}/payer-summary")
+def api_payer_summary(group_id: str):
+    """群組成員歷史累計墊付排行（管理頁的甜甜圈圖用）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT created_by_name, COALESCE(SUM(amount),0) AS total
+                   FROM expenses
+                   WHERE owner_type='group' AND owner_id=%s AND record_type != 'income'
+                   GROUP BY created_by_name
+                   ORDER BY total DESC""",
+                (group_id,)
+            )
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/groups/{group_id}/orders")
+def api_list_orders(group_id: str):
+    """歷史揪團訂單清單，並附上每個訂單的成員應付/已付明細（後端算好，前端不用再算）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT id, order_code, order_date, total_amount, master_payer_name, created_at
+                   FROM orders WHERE group_id=%s ORDER BY created_at DESC""",
+                (group_id,)
+            )
+            orders = cur.fetchall()
+
+            cur.execute(
+                "SELECT payer_name, order_code_ref, amount FROM settlements WHERE group_id=%s",
+                (group_id,)
+            )
+            settlements = cur.fetchall()
+
+            for o in orders:
+                cur.execute(
+                    "SELECT id, buyer_name, item_name, price FROM order_items WHERE order_id=%s ORDER BY id ASC",
+                    (o["id"],)
+                )
+                o["items"] = cur.fetchall()
+                o["created_at"] = o["created_at"].isoformat()
+                if hasattr(o["order_date"], "isoformat"):
+                    o["order_date"] = o["order_date"].isoformat()
+
+                expected = {}
+                for item in o["items"]:
+                    expected[item["buyer_name"]] = expected.get(item["buyer_name"], 0) + item["price"]
+                actual = {}
+                for s in settlements:
+                    if s["order_code_ref"] == o["order_code"]:
+                        actual[s["payer_name"]] = actual.get(s["payer_name"], 0) + s["amount"]
+                o["expected"] = expected
+                o["actual"] = actual
+
+        return orders
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/order-items/{item_id}")
+def api_update_order_item(item_id: int, body: OrderItemUpdate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT order_id FROM order_items WHERE id=%s", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="找不到此品項")
+            cur.execute(
+                "UPDATE order_items SET buyer_name=%s, item_name=%s, price=%s WHERE id=%s",
+                (body.buyer_name, body.item_name, body.price, item_id)
+            )
+            if row["order_id"]:
+                cur.execute(
+                    "UPDATE orders SET total_amount=(SELECT COALESCE(SUM(price),0) FROM order_items WHERE order_id=%s) WHERE id=%s",
+                    (row["order_id"], row["order_id"])
+                )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/order-items/{item_id}")
+def api_delete_order_item(item_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT order_id FROM order_items WHERE id=%s", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="找不到此品項")
+            cur.execute("DELETE FROM order_items WHERE id=%s", (item_id,))
+            if row["order_id"]:
+                cur.execute(
+                    "UPDATE orders SET total_amount=(SELECT COALESCE(SUM(price),0) FROM order_items WHERE order_id=%s) WHERE id=%s",
+                    (row["order_id"], row["order_id"])
+                )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/groups/{group_id}/orders/{order_id}")
+def api_delete_order(group_id: str, order_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM order_items WHERE order_id=%s AND group_id=%s", (order_id, group_id))
+            cur.execute("DELETE FROM orders WHERE id=%s AND group_id=%s", (order_id, group_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8005)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
