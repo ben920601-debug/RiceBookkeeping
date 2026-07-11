@@ -4,6 +4,7 @@ import json
 import random
 import httpx
 from datetime import datetime
+from contextlib import contextmanager
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -22,17 +23,21 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-# Google GenAI & Firebase SDK
+# Google GenAI & MySQL
 from google import genai
 from google.genai import types
-import firebase_admin
-from firebase_admin import credentials, firestore
+import pymysql
+from pymysql.cursors import DictCursor
 
 from dotenv import load_dotenv
 
+import certifi
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
 load_dotenv()
 
-app = FastAPI(title="記帳米粒 ｜ V1.1說明與關鍵字優化版")
+app = FastAPI(title="記帳米粒 ｜ V1.2 MySQL 版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,18 +59,40 @@ line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-if os.path.exists("firebase-adminsdk.json"):
+MYSQL_CONFIG = {
+    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "user": os.getenv("MYSQL_USER"),
+    "password": os.getenv("MYSQL_PASSWORD"),
+    "database": os.getenv("MYSQL_DATABASE", "jizhang_mili"),
+    "charset": "utf8mb4",
+    "cursorclass": DictCursor,
+    "autocommit": True,
+}
+
+def get_db_connection():
+    """建立一個新的 MySQL 連線；用完即關閉，避免長連線逾時被資料庫斷開"""
+    return pymysql.connect(**MYSQL_CONFIG)
+
+@contextmanager
+def db_cursor():
+    """統一管理連線與游標的 context manager，離開時自動關閉連線"""
+    conn = get_db_connection()
     try:
-        cred = credentials.Certificate("firebase-adminsdk.json")
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print("🔥 [DATABASE] Firestore 連線就位！", flush=True)
-    except Exception as e:
-        db = None
-        print(f"❌ [DATABASE] 連線初始化異常: {e}", flush=True)
-else:
-    db = None
-    print("❌ [DATABASE] 嚴重錯誤：未尋獲 firebase-adminsdk.json！", flush=True)
+        with conn.cursor() as cur:
+            yield cur
+    finally:
+        conn.close()
+
+DB_READY = False
+try:
+    _test_conn = get_db_connection()
+    _test_conn.close()
+    DB_READY = True
+    print("🔥 [DATABASE] MySQL 連線就位！", flush=True)
+except Exception as e:
+    DB_READY = False
+    print(f"❌ [DATABASE] MySQL 連線初始化異常: {e}", flush=True)
 
 # ==========================================
 # 🛡️ 2. 全域型別與 V1.1 特定詞設定
@@ -187,19 +214,37 @@ def fetch_line_profile_name(user_id: str, target_id: str = None) -> str:
     return f"成員({user_id[:4]})"
 
 def resolve_id_to_name(target_id: str, user_id: str) -> str:
-    if not db or not user_id: return "群組夥伴"
-    if not user_id.startswith("U"): return user_id
+    """查詢群組成員暱稱快取，查不到就打 LINE API 並寫回快取表(對應原本 group_members 子集合)"""
+    if not DB_READY or not user_id:
+        return "群組夥伴"
+    if not user_id.startswith("U"):
+        return user_id
+
+    # 個人聊天情境：target_id 是使用者自己的 U-id，不是真正的群組 ID，
+    # groups 表裡不會有這筆資料，直接呼叫 LINE API 取得暱稱即可，不寫入 group_members 快取
+    if not (target_id.startswith("C") or target_id.startswith("R")):
+        return fetch_line_profile_name(user_id, None)
+
     try:
-        member_ref = db.collection("groups").document(target_id).collection("members").document(user_id)
-        doc_snap = member_ref.get()
-        if doc_snap.exists:
-            return doc_snap.to_dict().get("display_name", f"成員({user_id[:4]})")
-        else:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT display_name FROM group_members WHERE group_id=%s AND user_id=%s",
+                (target_id, user_id)
+            )
+            row = cur.fetchone()
+            if row:
+                return row["display_name"]
+
             real_name = fetch_line_profile_name(user_id, target_id)
-            member_ref.set({"user_id": user_id, "display_name": real_name, "updated_at": datetime.utcnow()})
+            cur.execute(
+                """INSERT INTO group_members (group_id, user_id, display_name)
+                   VALUES (%s, %s, %s)
+                   ON DUPLICATE KEY UPDATE display_name = VALUES(display_name)""",
+                (target_id, user_id, real_name)
+            )
             return real_name
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ resolve_id_to_name 查詢異常: {e}", flush=True)
     return f"成員({user_id[:4]})"
 
 # ==========================================
@@ -220,7 +265,7 @@ def handle_line_events_safe(body_str: str, signature: str):
 
 @line_handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    if not db: return
+    if not DB_READY: return
 
     user_text = event.message.text.strip()
     creator_id = event.source.user_id 
@@ -228,20 +273,30 @@ def handle_text_message(event):
     reply_token = event.reply_token 
     
     target_id = event.source.group_id if is_group else creator_id
-    root_collection = "groups" if is_group else "users"
+    root_collection = "groups" if is_group else "users"  # 保留供語意參考，實際寫入以 owner_type 欄位區分
 
     current_mode = "normal"
     active_code = ""
     
     if is_group:
-        group_doc_ref = db.collection("groups").document(target_id)
-        group_snap = group_doc_ref.get()
-        if group_snap.exists:
-            g_data = group_snap.to_dict()
-            current_mode = g_data.get("state", "normal")
-            active_code = g_data.get("active_order_code", "")
-        else:
-            group_doc_ref.set({"group_id": target_id, "state": "normal", "created_at": datetime.utcnow()})
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT state, active_order_code FROM `groups` WHERE group_id=%s",
+                    (target_id,)
+                )
+                row = cur.fetchone()
+                if row:
+                    current_mode = row["state"]
+                    active_code = row["active_order_code"] or ""
+                else:
+                    cur.execute(
+                        "INSERT INTO `groups` (group_id, state) VALUES (%s, 'normal')",
+                        (target_id,)
+                    )
+        except Exception as e:
+            print(f"❌ 群組狀態查詢異常: {e}", flush=True)
+            return
 
     is_bot_tagged = False
     mention = getattr(event.message, "mention", None)
@@ -260,16 +315,26 @@ def handle_text_message(event):
             return
             
         req_code = code_match.group(1)
-        order_found = None
-        orders_query = db.collection("groups").document(target_id).collection("orders").where("order_code", "==", req_code).stream()
-        for doc_obj in orders_query: order_found = doc_obj.to_dict(); break
-            
-        if not order_found:
-            send_line_reply(reply_token, f"❌ 找不到本群組內編號為 #{req_code} 的團購單。")
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT master_payer_id FROM orders WHERE group_id=%s AND order_code=%s ORDER BY id DESC LIMIT 1",
+                    (target_id, req_code)
+                )
+                order_found = cur.fetchone()
+                if not order_found:
+                    send_line_reply(reply_token, f"❌ 找不到本群組內編號為 #{req_code} 的團購單。")
+                    return
+
+                cur.execute(
+                    "UPDATE `groups` SET state='settle', active_order_code=%s WHERE group_id=%s",
+                    (req_code, target_id)
+                )
+        except Exception as e:
+            print(f"❌ 核銷解鎖查詢異常: {e}", flush=True)
             return
             
-        db.collection("groups").document(target_id).update({"state": "settle", "active_order_code": req_code})
-        payer_str = resolve_id_to_name(target_id, order_found.get('master_payer_id', creator_id))
+        payer_str = resolve_id_to_name(target_id, order_found.get("master_payer_id") or creator_id)
         send_line_reply(reply_token, f"🔓 成功解鎖結算模式！鎖定單號：#{req_code}\n💳 墊款買單人：{payer_str}\n👉 請開始核銷對帳（如：@記帳米粒 我核銷我自己 150）")
         return
 
@@ -278,13 +343,20 @@ def handle_text_message(event):
     # ====================================================
     if is_group and current_mode == "settle":
         if any(k in user_text for k in ["結算結束", "關閉結算", "核銷截止", "核銷完畢","截止","結束"]):
-            db.collection("groups").document(target_id).update({"state": "normal", "active_order_code": ""})
+            try:
+                with db_cursor() as cur:
+                    cur.execute(
+                        "UPDATE `groups` SET state='normal', active_order_code='' WHERE group_id=%s",
+                        (target_id,)
+                    )
+            except Exception as e:
+                print(f"❌ 結算關閉異常: {e}", flush=True)
             send_line_reply(reply_token, "🔓 結算完畢！已安全關閉對帳並恢復一般模式。")
             return
 
         if any(k in user_text for k in ["給", "還", "付", "收", "核銷"]):
-            clean_text = re.sub(r'#?\d{4}', '', user_text)
-            amount_match = re.search(r'\d+', clean_text)
+            clean_text_settle = re.sub(r'#?\d{4}', '', user_text)
+            amount_match = re.search(r'\d+', clean_text_settle)
             settle_amount = int(amount_match.group()) if amount_match else 0
             if settle_amount <= 0: return
 
@@ -301,31 +373,52 @@ def handle_text_message(event):
                 final_receiver_id = creator_id
                 
             if final_payer_id and final_receiver_id:
-                order_query = db.collection("groups").document(target_id).collection("orders").where("order_code", "==", active_code).stream()
-                current_order = None
-                for doc_obj in order_query: current_order = doc_obj.to_dict(); break
-                if not current_order: return
-                
-                payer_expected_total = sum(item.get("price", 0) for item in current_order.get("items", []) if item.get("buyer_id") == final_payer_id or item.get("buyer") == final_payer_id)
-                history_settles = db.collection("groups").document(target_id).collection("settlements").where("order_code_ref", "==", active_code).where("payer_id", "==", final_payer_id).stream()
-                payer_already_paid = sum(doc_obj.to_dict().get("amount", 0) for doc_obj in history_settles)
-                remaining_debt = payer_expected_total - payer_already_paid
-                
-                if remaining_debt <= 0:
-                    send_line_reply(reply_token, f"❌ 登記拒絕！成員 {resolve_id_to_name(target_id, final_payer_id)} 在單號 #{active_code} 中並無欠款紀錄。")
-                    return
-                elif settle_amount > remaining_debt:
-                    send_line_reply(reply_token, f"❌ 入帳失敗！金額溢繳！\n⚠️ 該成員此單賸餘應付為：${remaining_debt} 元，您輸入的 ${settle_amount} 元不符合規範，拒絕入帳。")
-                    return
-                
-                payer_name_str = resolve_id_to_name(target_id, final_payer_id)
-                receiver_name_str = resolve_id_to_name(target_id, final_receiver_id)
+                try:
+                    with db_cursor() as cur:
+                        cur.execute(
+                            "SELECT id FROM orders WHERE group_id=%s AND order_code=%s ORDER BY id DESC LIMIT 1",
+                            (target_id, active_code)
+                        )
+                        current_order = cur.fetchone()
+                        if not current_order:
+                            return
+                        order_pk = current_order["id"]
 
-                db.collection("groups").document(target_id).collection("settlements").document().set({
-                    "payer_id": final_payer_id, "receiver_id": final_receiver_id,
-                    "payer_name": payer_name_str, "receiver_name": receiver_name_str,   
-                    "amount": settle_amount, "order_code_ref": active_code, "timestamp": datetime.utcnow()
-                })
+                        cur.execute(
+                            """SELECT COALESCE(SUM(price), 0) AS total FROM order_items
+                               WHERE order_id=%s AND buyer_id=%s""",
+                            (order_pk, final_payer_id)
+                        )
+                        payer_expected_total = cur.fetchone()["total"]
+
+                        cur.execute(
+                            """SELECT COALESCE(SUM(amount), 0) AS total FROM settlements
+                               WHERE group_id=%s AND order_code_ref=%s AND payer_id=%s""",
+                            (target_id, active_code, final_payer_id)
+                        )
+                        payer_already_paid = cur.fetchone()["total"]
+
+                        remaining_debt = payer_expected_total - payer_already_paid
+
+                        if remaining_debt <= 0:
+                            send_line_reply(reply_token, f"❌ 登記拒絕！成員 {resolve_id_to_name(target_id, final_payer_id)} 在單號 #{active_code} 中並無欠款紀錄。")
+                            return
+                        elif settle_amount > remaining_debt:
+                            send_line_reply(reply_token, f"❌ 入帳失敗！金額溢繳！\n⚠️ 該成員此單賸餘應付為：${remaining_debt} 元，您輸入的 ${settle_amount} 元不符合規範，拒絕入帳。")
+                            return
+
+                        payer_name_str = resolve_id_to_name(target_id, final_payer_id)
+                        receiver_name_str = resolve_id_to_name(target_id, final_receiver_id)
+
+                        cur.execute(
+                            """INSERT INTO settlements
+                               (group_id, order_code_ref, payer_id, payer_name, receiver_id, receiver_name, amount)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                            (target_id, active_code, final_payer_id, payer_name_str, final_receiver_id, receiver_name_str, settle_amount)
+                        )
+                except Exception as e:
+                    print(f"❌ 核銷寫入異常: {e}", flush=True)
+                    return
 
                 if final_payer_id == final_receiver_id:
                     send_line_reply(reply_token, f"✅ 【單號 #{active_code} 核銷成功】\n🙋‍♂️ 自行核銷：{payer_name_str}\n💰 紀錄金額：${settle_amount}")
@@ -345,10 +438,15 @@ def handle_text_message(event):
             return
 
     # ====================================================
-    # 📖 【Python 層攔慢截：系統說明書與報表派發】
+    # 📖 【Python 層攔截：系統說明書與報表派發】
     # ====================================================
     if any(k in clean_text for k in ["報表", "查帳", "大後台", "網址", "網站", "入口", "登入"]) and current_mode == "normal":
-        send_line_reply(reply_token, f"📊 【記帳米粒 ｜ 雲端監控後台】\n🟢 入口如下：\nhttps://liff.line.me/{MY_LIFF_ID}?groupId={target_id}")
+        if is_group:
+            # 群組情境：走到這裡代表已被 tag(is_bot_tagged 檢查已在前面攔截),提供帶 groupId 的後台網址
+            send_line_reply(reply_token, f"📊 【記帳米粒 ｜ 雲端監控後台】\n🟢 入口如下：\nhttps://liff.line.me/{MY_LIFF_ID}?groupId={target_id}")
+        else:
+            # 個人情境：不提供網址(避免 groupId 誤帶入個人 user_id 導致資料混淆),改導引至圖文選單
+            send_line_reply(reply_token, "📊 個人記帳報表請點選下方圖文選單即可查看喔！")
         return
 
     # 配合 V1.1 更新：精簡優化版的使用說明導覽
@@ -391,11 +489,19 @@ def handle_text_message(event):
         if not item_name.isdigit() and amount > 0:
             if current_mode == "normal":
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
-                db.collection(root_collection).document(target_id).collection("expenses").document().set({
-                    "type": "expense", "amount": amount, "item": item_name, "category": "生活雜費",
-                    "timestamp": datetime.utcnow(), "created_by_uid": creator_id, "created_by_name": creator_name_str
-                })
-                send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}")
+                owner_type = "group" if is_group else "user"
+                try:
+                    with db_cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO expenses
+                               (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
+                               VALUES (%s, %s, 'expense', %s, %s, '生活雜費', %s, %s)""",
+                            (owner_type, target_id, amount, item_name, creator_id, creator_name_str)
+                        )
+                    send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}")
+                except Exception as e:
+                    print(f"❌ 記帳寫入異常: {e}", flush=True)
+                    send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
                 return
                 
             elif current_mode == "order" and is_group:
@@ -404,14 +510,18 @@ def handle_text_message(event):
                 actual_buyer_id = real_tagged_ids[0] if real_tagged_ids else creator_id
                 actual_buyer_name = resolve_id_to_name(target_id, actual_buyer_id)
                 
-                g_ref = db.collection("groups").document(target_id)
-                temp_items = g_ref.get().to_dict().get("order_items_temp", [])
-                temp_items.append({
-                    "buyer_id": actual_buyer_id, "buyer": actual_buyer_name,
-                    "item": item_name, "price": amount, "timestamp": datetime.utcnow().isoformat()
-                })
-                g_ref.update({"order_items_temp": temp_items})
-                send_line_reply(reply_token, f"📝 已接單：{item_name} ${amount}")
+                try:
+                    with db_cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO order_items
+                               (group_id, order_code, buyer_id, buyer_name, item_name, price)
+                               VALUES (%s, %s, %s, %s, %s, %s)""",
+                            (target_id, active_code, actual_buyer_id, actual_buyer_name, item_name, amount)
+                        )
+                    send_line_reply(reply_token, f"📝 已接單：{item_name} ${amount}")
+                except Exception as e:
+                    print(f"❌ 團購品項寫入異常: {e}", flush=True)
+                    send_line_reply(reply_token, "⚠️ 接單失敗，請稍後再試一次。")
                 return
 
     # ====================================================
@@ -438,65 +548,95 @@ def handle_text_message(event):
         if result.intent == "record":
             if result.records:
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
-                for rec in result.records:
-                    if rec.amount > 0:
-                        db.collection(root_collection).document(target_id).collection("expenses").document().set({
-                            "type": rec.record_type, "amount": rec.amount, "item": rec.item, "category": rec.category,
-                            "timestamp": datetime.utcnow(), "created_by_uid": creator_id, "created_by_name": creator_name_str
-                        })
+                owner_type = "group" if is_group else "user"
+                try:
+                    with db_cursor() as cur:
+                        for rec in result.records:
+                            if rec.amount > 0:
+                                cur.execute(
+                                    """INSERT INTO expenses
+                                       (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                    (owner_type, target_id, rec.record_type, rec.amount, rec.item, rec.category, creator_id, creator_name_str)
+                                )
+                except Exception as e:
+                    print(f"❌ AI 記帳寫入異常: {e}", flush=True)
                 reply_text = result.ai_reply if result.ai_reply else f"✅ 已為您紀錄花費。"
                 send_line_reply(reply_token, f"🤖 {reply_text}")
 
         # 2. 開團模式
         elif result.intent == "order_start" and is_group:
             code_str = str(random.randint(1000, 9999))
-            db.collection("groups").document(target_id).update({"state": "order", "active_order_code": code_str, "order_items_temp": []})
-            reply_text = result.ai_reply if result.ai_reply else f"🚀 【團購已啟動】本團單號：#{code_str}\n👉 請大家叫單時記得「@記帳米粒 品項 金額」喔！"
-            send_line_reply(reply_token, reply_text)
+            try:
+                with db_cursor() as cur:
+                    cur.execute(
+                        "UPDATE `groups` SET state='order', active_order_code=%s WHERE group_id=%s",
+                        (code_str, target_id)
+                    )
+                reply_text = result.ai_reply if result.ai_reply else f"🚀 【團購已啟動】本團單號：#{code_str}\n👉 請大家叫單時記得「@記帳米粒 品項 金額」喔！"
+                send_line_reply(reply_token, reply_text)
+            except Exception as e:
+                print(f"❌ 開團寫入異常: {e}", flush=True)
 
         # 3. AI 萃取複雜點單與代點單
         elif result.intent == "order_item" and current_mode == "order" and is_group:
             if result.order_items:
-                g_ref = db.collection("groups").document(target_id)
-                temp_items = g_ref.get().to_dict().get("order_items_temp", [])
-                
                 real_tagged_ids = get_real_mentions(event)
                 actual_buyer_id = real_tagged_ids[0] if real_tagged_ids else creator_id
                 actual_buyer_name = resolve_id_to_name(target_id, actual_buyer_id)
                 
                 reply_lines = []
-                for item in result.order_items:
-                    clean_item_name = re.sub(r'@\S+', '', item.item_name).strip()
-                    temp_items.append({
-                        "buyer_id": actual_buyer_id, "buyer": actual_buyer_name,
-                        "item": clean_item_name, "price": item.price, "timestamp": datetime.utcnow().isoformat()
-                    })
-                    reply_lines.append(f"📝 已接單：{clean_item_name} ${item.price}")
-                    
-                g_ref.update({"order_items_temp": temp_items})
-                send_line_reply(reply_token, "\n".join(reply_lines))
+                try:
+                    with db_cursor() as cur:
+                        for item in result.order_items:
+                            clean_item_name = re.sub(r'@\S+', '', item.item_name).strip()
+                            cur.execute(
+                                """INSERT INTO order_items
+                                   (group_id, order_code, buyer_id, buyer_name, item_name, price)
+                                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                                (target_id, active_code, actual_buyer_id, actual_buyer_name, clean_item_name, item.price)
+                            )
+                            reply_lines.append(f"📝 已接單：{clean_item_name} ${item.price}")
+                    send_line_reply(reply_token, "\n".join(reply_lines))
+                except Exception as e:
+                    print(f"❌ AI 團購品項寫入異常: {e}", flush=True)
 
         # 4. 截止結單
         elif result.intent == "order_end" and current_mode == "order" and is_group:
-            g_ref = db.collection("groups").document(target_id)
-            g_data = g_ref.get().to_dict()
-            active_code = g_data.get("active_order_code", "")
-            temp_items = g_data.get("order_items_temp", [])
-            
-            if temp_items:
-                total_amt = sum(i["price"] for i in temp_items)
-                creator_name_str = resolve_id_to_name(target_id, creator_id)
-                
-                g_ref.collection("orders").document(f"{datetime.now().strftime('%Y%m%d')}_{active_code}").set({
-                    "order_date": datetime.now().strftime("%Y-%m-%d"), "order_code": active_code, "total_amount": total_amt,
-                    "master_payer_id": creator_id, "master_payer_name": creator_name_str, "items": temp_items, "timestamp": datetime.utcnow()
-                })
-                reply_text = result.ai_reply if result.ai_reply else f"🏁 【團購截止 ｜ 單號 #{active_code}】\n💰 總金額：${total_amt} 元\n💳 墊款：{creator_name_str}\n\n🤖 數據已更新！"
-                send_line_reply(reply_token, reply_text)
-            else:
-                send_line_reply(reply_token, "🛑 因無人叫單，本團已直接關閉。")
-                
-            g_ref.update({"state": "normal", "order_items_temp": []})
+            try:
+                with db_cursor() as cur:
+                    cur.execute(
+                        """SELECT COALESCE(SUM(price), 0) AS total, COUNT(*) AS cnt
+                           FROM order_items WHERE group_id=%s AND order_code=%s AND order_id IS NULL""",
+                        (target_id, active_code)
+                    )
+                    agg = cur.fetchone()
+                    total_amt = agg["total"]
+                    item_count = agg["cnt"]
+
+                    if item_count > 0:
+                        creator_name_str = resolve_id_to_name(target_id, creator_id)
+                        cur.execute(
+                            """INSERT INTO orders (group_id, order_code, order_date, total_amount, master_payer_id, master_payer_name)
+                               VALUES (%s, %s, CURDATE(), %s, %s, %s)""",
+                            (target_id, active_code, total_amt, creator_id, creator_name_str)
+                        )
+                        new_order_id = cur.lastrowid
+                        cur.execute(
+                            "UPDATE order_items SET order_id=%s WHERE group_id=%s AND order_code=%s AND order_id IS NULL",
+                            (new_order_id, target_id, active_code)
+                        )
+                        reply_text = result.ai_reply if result.ai_reply else f"🏁 【團購截止 ｜ 單號 #{active_code}】\n💰 總金額：${total_amt} 元\n💳 墊款：{creator_name_str}\n\n🤖 數據已更新！"
+                        send_line_reply(reply_token, reply_text)
+                    else:
+                        send_line_reply(reply_token, "🛑 因無人叫單，本團已直接關閉。")
+
+                    cur.execute(
+                        "UPDATE `groups` SET state='normal', active_order_code='' WHERE group_id=%s",
+                        (target_id,)
+                    )
+            except Exception as e:
+                print(f"❌ 結單處理異常: {e}", flush=True)
 
         # 5. 純粹對話陪聊
         elif result.intent == "chat" and result.ai_reply:
@@ -507,8 +647,8 @@ def handle_text_message(event):
 
 @app.get("/")
 def health_check(): 
-    return {"status": "fast_regex_active", "version": "v1.1-Instruction-Optimized"}
+    return {"status": "mysql_active", "version": "v1.2-MySQL"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8005)
