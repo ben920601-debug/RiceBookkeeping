@@ -1,9 +1,14 @@
 fastapi
 uvicorn
 pydantic
-google-genai
-openai
-line-bot-sdk
-firebase-admin
 python-dotenv
 httpx
+certifi
+line-bot-sdk>=3.0.0
+google-genai
+pymysql
+cryptography
+
+# 中控後台新增依賴
+DBUtils>=3.0.0
+PyJWT>=2.7.0

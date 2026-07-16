@@ -2,7 +2,9 @@ import os
 import re
 import json
 import random
+import time
 import httpx
+import certifi
 from datetime import datetime
 from contextlib import contextmanager
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -28,10 +30,20 @@ from google import genai
 from google.genai import types
 import pymysql
 from pymysql.cursors import DictCursor
+from dbutils.pooled_db import PooledDB  # 🔌 連線池：取代每次手動開關連線，避免逾時被斷線與連線數暴增
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ==========================================
+# 🔒 SSL 憑證修正（常見於 macOS：Python 找不到系統根憑證）
+# ------------------------------------------
+# 用 certifi 提供的憑證包，直接指定給整個程式（含 LINE SDK、httpx）使用，
+# 不用再手動 export SSL_CERT_FILE，每次開新終端機都要重設。
+# ==========================================
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 app = FastAPI(title="記帳米粒 ｜ V1.2 MySQL 版")
 
@@ -66,13 +78,40 @@ MYSQL_CONFIG = {
     "autocommit": True,
 }
 
+# ==========================================
+# 🔌 連線池（DBUtils PooledDB）
+# ------------------------------------------
+# 舊版每次都 pymysql.connect() 再手動 close()，長時間閒置或雲端資料庫
+# 主動斷線時容易出現「連線逾時被斷開」或短時間內連線數暴增的問題。
+# 改用連線池後：
+#   - mincached/maxcached：常駐可回收的連線，減少重複建立連線的開銷
+#   - maxconnections：連線數上限，避免暴增拖垮資料庫
+#   - ping=1：每次向池子借用連線時都會自動檢查連線是否還活著，
+#             失效就自動重連，從根本解決「連線逾時被斷開」的問題
+# ==========================================
+DB_POOL = None
+
+def _init_pool():
+    global DB_POOL
+    DB_POOL = PooledDB(
+        creator=pymysql,
+        mincached=2,
+        maxcached=5,
+        maxconnections=20,
+        blocking=True,
+        ping=1,
+        **MYSQL_CONFIG,
+    )
+
 def get_db_connection():
-    """建立一個新的 MySQL 連線；用完即關閉，避免長連線逾時被資料庫斷開"""
-    return pymysql.connect(**MYSQL_CONFIG)
+    """從連線池借用一條連線；用完呼叫 .close() 只是歸還給池子，不會真的斷線"""
+    if DB_POOL is None:
+        _init_pool()
+    return DB_POOL.connection()
 
 @contextmanager
 def db_cursor():
-    """統一管理連線與游標的 context manager，離開時自動關閉連線"""
+    """統一管理連線與游標的 context manager，離開時自動歸還連線給連線池"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -82,27 +121,30 @@ def db_cursor():
 
 DB_READY = False
 try:
-    _test_conn = get_db_connection()
-    _test_conn.close()
+    _init_pool()
+    with db_cursor() as _cur:
+        _cur.execute("SELECT 1")
     DB_READY = True
-    print("🔥 [DATABASE] MySQL 連線就位！", flush=True)
+    print("🔥 [DATABASE] MySQL 連線池就位！", flush=True)
 except Exception as e:
     DB_READY = False
     print(f"❌ [DATABASE] MySQL 連線初始化異常: {e}", flush=True)
 
 # ==========================================
-# 🛡️ 2. 全域型別與 V1.1 特定詞設定
+# 🛡️ 2. 全域型別設定
 # ==========================================
-SENSITIVE_KEYWORDS = ["政治", "選舉", "總統", "政黨", "戰爭", "吸毒", "賭博", "情色", "自殺", "殺人"]
+# 🚀 V1.3 改版：SENSITIVE_KEYWORDS / SPECIFIC_KEYWORDS 不再寫死在程式碼裡，
+# 改成從資料庫的 sensitive_words / keyword_replies 表讀取，
+# 並在中控後台開放線上新增、編輯、刪除 —— 修改內容不用再改程式碼、也不用重新部署。
+# 這裡保留「初次啟動、資料庫還沒有任何資料時」的預設值，僅在資料表為空時會自動灌入一次。
+DEFAULT_SENSITIVE_KEYWORDS = ["政治", "選舉", "總統", "政黨", "戰爭", "吸毒", "賭博", "情色", "自殺", "殺人"]
 
-# 🚀 V1.1 新增：特定詞觸發指定回覆話語（快速硬編碼攔截層）
-SPECIFIC_KEYWORDS = {
+DEFAULT_KEYWORD_REPLIES = {
     "電鍋": (
         "說到電鍋我最熟了，畢竟他也是我的創造者！\n"
         "他創造我之外呢，也創造了飯匙在不同地方服務大眾😄\n"
         "如有興趣，歡迎到下方點選前往IG或是找@denguword1220\n"
         "非常期待與您有更多的互動😆"
-
     ),
     "思妤是誰？": (
         "思妤是一個瘋女人！\n"
@@ -122,6 +164,83 @@ SPECIFIC_KEYWORDS = {
         "尤其是他吼人的時候好帥喔😆"
     )
 }
+
+# ------------------------------------------
+# 🗄️ 輕量快取：避免每一則訊息都去查資料庫
+# 中控後台修改資料後，最多 CACHE_TTL 秒內會自動生效，不需要重啟服務
+# ------------------------------------------
+CACHE_TTL = 15  # 秒
+_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": []}
+
+def _seed_defaults_if_empty():
+    """服務第一次啟動、資料表全空時，把原本寫死的內容灌進資料庫一次，之後就都用資料庫版本"""
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM keyword_replies")
+            if cur.fetchone()["cnt"] == 0:
+                for kw, reply in DEFAULT_KEYWORD_REPLIES.items():
+                    cur.execute(
+                        "INSERT IGNORE INTO keyword_replies (keyword, reply_text, enabled) VALUES (%s, %s, 1)",
+                        (kw, reply)
+                    )
+            cur.execute("SELECT COUNT(*) AS cnt FROM sensitive_words")
+            if cur.fetchone()["cnt"] == 0:
+                for w in DEFAULT_SENSITIVE_KEYWORDS:
+                    cur.execute("INSERT IGNORE INTO sensitive_words (word) VALUES (%s)", (w,))
+            cur.execute("INSERT IGNORE INTO bot_settings (`key`, `value`) VALUES ('bot_enabled', '1')")
+    except Exception as e:
+        print(f"⚠️ 預設資料灌入失敗（若資料表尚未建立，請先執行 migration.sql）: {e}", flush=True)
+
+def _refresh_cache_if_stale():
+    if time.time() - _cache["ts"] < CACHE_TTL:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT `value` FROM bot_settings WHERE `key`='bot_enabled'")
+            row = cur.fetchone()
+            _cache["bot_enabled"] = (row is None) or (row["value"] == "1")
+
+            cur.execute("SELECT keyword, reply_text FROM keyword_replies WHERE enabled=1")
+            _cache["keyword_replies"] = {r["keyword"]: r["reply_text"] for r in cur.fetchall()}
+
+            cur.execute("SELECT word FROM sensitive_words")
+            _cache["sensitive_words"] = [r["word"] for r in cur.fetchall()]
+
+            _cache["ts"] = time.time()
+    except Exception as e:
+        print(f"⚠️ 設定快取更新失敗，沿用舊值: {e}", flush=True)
+
+def is_bot_enabled() -> bool:
+    _refresh_cache_if_stale()
+    return _cache["bot_enabled"]
+
+def get_keyword_replies() -> dict:
+    _refresh_cache_if_stale()
+    return _cache["keyword_replies"]
+
+def get_sensitive_words() -> list:
+    _refresh_cache_if_stale()
+    return _cache["sensitive_words"]
+
+def log_error(source: str, message: str, target_id: str = None):
+    """統一錯誤記錄：畫面上印出來方便看 log，同時寫進 error_logs 表供中控後台檢視"""
+    print(f"❌ [{source}] {message}", flush=True)
+    if not DB_READY:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "INSERT INTO error_logs (source, message, target_id) VALUES (%s, %s, %s)",
+                (source, str(message)[:2000], target_id)
+            )
+    except Exception:
+        pass  # 記錄失敗就算了，不能讓記錄本身又炸掉主流程
+
+# ※ 中控後台的登入驗證（帳密、JWT）已搬到獨立專案 admin-panel，這裡不再需要。
+
+# 所有快取/預設值相關函式都定義完成後，這裡才是真正安全的呼叫時機
+if DB_READY:
+    _seed_defaults_if_empty()
 
 class SingleRecord(BaseModel):
     record_type: Literal["expense", "income"] = Field(default="expense")
@@ -158,7 +277,7 @@ def send_line_reply(reply_token: str, text: str):
                 ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
             )
     except Exception as e:
-        print(f"❌ LINE 回覆失敗: {e}", flush=True)
+        log_error("LINE回覆", e)
 
 def get_real_mentions(event) -> list:
     """🎯 核心修復：過濾掉機器人自身的 Tag，只抓取真實成員的 ID"""
@@ -191,7 +310,7 @@ def fetch_line_profile_name(user_id: str, target_id: str = None) -> str:
             
         if url:
             try:
-                res = httpx.get(url, headers=headers, timeout=5.0, follow_redirects=True)
+                res = httpx.get(url, headers=headers, timeout=5.0, follow_redirects=True, verify=certifi.where())
                 if res.status_code == 200:
                     return res.json().get("displayName", f"成員({user_id[:4]})")
                 else:
@@ -201,7 +320,7 @@ def fetch_line_profile_name(user_id: str, target_id: str = None) -> str:
             
     url = f"https://api.line.me/v2/bot/profile/{user_id}"
     try:
-        res = httpx.get(url, headers=headers, timeout=5.0, follow_redirects=True)
+        res = httpx.get(url, headers=headers, timeout=5.0, follow_redirects=True, verify=certifi.where())
         if res.status_code == 200:
             return res.json().get("displayName", f"成員({user_id[:4]})")
     except Exception as e:
@@ -262,6 +381,7 @@ def handle_line_events_safe(body_str: str, signature: str):
 @line_handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
     if not DB_READY: return
+    if not is_bot_enabled(): return  # 🔴 中控後台的「全域開關」關閉時，機器人直接靜默不回應
 
     user_text = event.message.text.strip()
     creator_id = event.source.user_id 
@@ -291,7 +411,7 @@ def handle_text_message(event):
                         (target_id,)
                     )
         except Exception as e:
-            print(f"❌ 群組狀態查詢異常: {e}", flush=True)
+            log_error("群組狀態查詢", e, target_id)
             return
 
     is_bot_tagged = False
@@ -327,7 +447,7 @@ def handle_text_message(event):
                     (req_code, target_id)
                 )
         except Exception as e:
-            print(f"❌ 核銷解鎖查詢異常: {e}", flush=True)
+            log_error("核銷解鎖查詢", e, target_id)
             return
             
         payer_str = resolve_id_to_name(target_id, order_found.get("master_payer_id") or creator_id)
@@ -346,7 +466,7 @@ def handle_text_message(event):
                         (target_id,)
                     )
             except Exception as e:
-                print(f"❌ 結算關閉異常: {e}", flush=True)
+                log_error("結算關閉", e, target_id)
             send_line_reply(reply_token, "🔓 結算完畢！已安全關閉對帳並恢復一般模式。")
             return
 
@@ -413,7 +533,7 @@ def handle_text_message(event):
                             (target_id, active_code, final_payer_id, payer_name_str, final_receiver_id, receiver_name_str, settle_amount)
                         )
                 except Exception as e:
-                    print(f"❌ 核銷寫入異常: {e}", flush=True)
+                    log_error("核銷寫入", e, target_id)
                     return
 
                 if final_payer_id == final_receiver_id:
@@ -428,7 +548,7 @@ def handle_text_message(event):
     # ====================================================
     # 🎯 ⚡ 【V1.1 Python 層攔截：新增特定詞觸發指定回覆】
     # ====================================================
-    for kw, reply_msg in SPECIFIC_KEYWORDS.items():
+    for kw, reply_msg in get_keyword_replies().items():
         if kw in clean_text:
             send_line_reply(reply_token, reply_msg)
             return
@@ -451,8 +571,10 @@ def handle_text_message(event):
             "🌾 【記帳米粒 | 快速上手指南】\n"
             "-------------------------\n"
             "💰 1. 一般記帳 \n"
-            "👉 輸入「項目 金額」即可\n"
-            "   └ 範例：早餐 80 元\n\n"
+            "👉 輸入「項目 金額」記支出\n"
+            "   └ 範例：早餐 80 元\n"
+            "👉 開頭加「收入」或「+」記收入\n"
+            "   └ 範例：收入 薪水 30000 / +接案 5000\n\n"
             "🛒 2. 團隊開團 (揪團模式)\n"
             "👉 輸入「開團」啟動專屬單號\n"
             "   └ 自點：冰美式 55\n"
@@ -467,15 +589,25 @@ def handle_text_message(event):
         send_line_reply(reply_token, instructions)
         return
 
-    for kw in SENSITIVE_KEYWORDS:
+    for kw in get_sensitive_words():
         if kw in clean_text:
             send_line_reply(reply_token, "🤖 米粒為純財務助理，請勿探討敏感議題喔！")
             return
 
     # ====================================================
     # ⚡ 🚀 【Python 第一層極速攔截：代點單與記帳直通落庫】
+    # ------------------------------------------------------
+    # 🆕 一般模式下，開頭加「收入」或「+」可以快速記成收入，
+    #    例如：「收入 薪水 30000」「+薪水 30000」，其餘輸入一律當支出。
+    #    （揪團模式不受影響，維持原本的代點單邏輯）
     # ====================================================
-    fast_match = re.fullmatch(r'^(.+?)\s*(\d+)\s*(?:元|塊)?$', clean_text)
+    income_prefix_match = None
+    if current_mode == "normal":
+        income_prefix_match = re.match(r'^(?:收入|\+)\s*(.+)$', clean_text)
+    is_income_quick = bool(income_prefix_match)
+    text_for_fast_match = income_prefix_match.group(1) if income_prefix_match else clean_text
+
+    fast_match = re.fullmatch(r'^(.+?)\s*(\d+)\s*(?:元|塊)?$', text_for_fast_match)
     if fast_match and current_mode in ["normal", "order"]:
         raw_item_name = fast_match.group(1).strip()
         amount = int(fast_match.group(2))
@@ -486,17 +618,21 @@ def handle_text_message(event):
             if current_mode == "normal":
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
                 owner_type = "group" if is_group else "user"
+                record_type = "income" if is_income_quick else "expense"
                 try:
                     with db_cursor() as cur:
                         cur.execute(
                             """INSERT INTO expenses
                                (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
-                               VALUES (%s, %s, 'expense', %s, %s, '生活雜費', %s, %s)""",
-                            (owner_type, target_id, amount, item_name, creator_id, creator_name_str)
+                               VALUES (%s, %s, %s, %s, %s, '生活雜費', %s, %s)""",
+                            (owner_type, target_id, record_type, amount, item_name, creator_id, creator_name_str)
                         )
-                    send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}")
+                    if is_income_quick:
+                        send_line_reply(reply_token, f"💰 已紀錄收入：{item_name} ${amount}")
+                    else:
+                        send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}")
                 except Exception as e:
-                    print(f"❌ 記帳寫入異常: {e}", flush=True)
+                    log_error("記帳寫入", e, target_id)
                     send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
                 return
                 
@@ -516,7 +652,7 @@ def handle_text_message(event):
                         )
                     send_line_reply(reply_token, f"📝 已接單：{item_name} ${amount}")
                 except Exception as e:
-                    print(f"❌ 團購品項寫入異常: {e}", flush=True)
+                    log_error("團購品項寫入", e, target_id)
                     send_line_reply(reply_token, "⚠️ 接單失敗，請稍後再試一次。")
                 return
 
@@ -556,7 +692,7 @@ def handle_text_message(event):
                                     (owner_type, target_id, rec.record_type, rec.amount, rec.item, rec.category, creator_id, creator_name_str)
                                 )
                 except Exception as e:
-                    print(f"❌ AI 記帳寫入異常: {e}", flush=True)
+                    log_error("AI記帳寫入", e, target_id)
                 reply_text = result.ai_reply if result.ai_reply else f"✅ 已為您紀錄花費。"
                 send_line_reply(reply_token, f"🤖 {reply_text}")
 
@@ -572,7 +708,7 @@ def handle_text_message(event):
                 reply_text = result.ai_reply if result.ai_reply else f"🚀 【團購已啟動】本團單號：#{code_str}\n👉 請大家叫單時記得「@記帳米粒 品項 金額」喔！"
                 send_line_reply(reply_token, reply_text)
             except Exception as e:
-                print(f"❌ 開團寫入異常: {e}", flush=True)
+                log_error("開團寫入", e, target_id)
 
         # 3. AI 萃取複雜點單與代點單
         elif result.intent == "order_item" and current_mode == "order" and is_group:
@@ -595,7 +731,7 @@ def handle_text_message(event):
                             reply_lines.append(f"📝 已接單：{clean_item_name} ${item.price}")
                     send_line_reply(reply_token, "\n".join(reply_lines))
                 except Exception as e:
-                    print(f"❌ AI 團購品項寫入異常: {e}", flush=True)
+                    log_error("AI團購品項寫入", e, target_id)
 
         # 4. 截止結單
         elif result.intent == "order_end" and current_mode == "order" and is_group:
@@ -632,14 +768,14 @@ def handle_text_message(event):
                         (target_id,)
                     )
             except Exception as e:
-                print(f"❌ 結單處理異常: {e}", flush=True)
+                log_error("結單處理", e, target_id)
 
         # 5. 純粹對話陪聊
         elif result.intent == "chat" and result.ai_reply:
             send_line_reply(reply_token, f"🤖 {result.ai_reply}")
 
     except Exception as e:
-        print(f"🧠 解析異常: {e}")
+        log_error("Gemini解析", e, target_id)
 
 @app.get("/")
 def health_check(): 
@@ -871,8 +1007,6 @@ def api_delete_order(group_id: str, order_id: int):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 if __name__ == "__main__":
     import uvicorn
