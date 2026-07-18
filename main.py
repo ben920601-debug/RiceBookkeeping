@@ -45,7 +45,7 @@ load_dotenv()
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
-app = FastAPI(title="記帳米粒 ｜ V1.2 MySQL 版")
+app = FastAPI(title="記帳米粒 ｜ V1.3 MySQL 版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,8 +169,10 @@ DEFAULT_KEYWORD_REPLIES = {
 # 🗄️ 輕量快取：避免每一則訊息都去查資料庫
 # 中控後台修改資料後，最多 CACHE_TTL 秒內會自動生效，不需要重啟服務
 # ------------------------------------------
-CACHE_TTL = 15  # 秒
-_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": []}
+CACHE_TTL = 5  # 秒（原本15秒，縮短以減少「關閉機器人」等設定生效的延遲）
+_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": [], "maintenance_message": ""}
+
+DEFAULT_MAINTENANCE_MESSAGE = "🤖 系統維護中，請稍後再試。"
 
 def _seed_defaults_if_empty():
     """服務第一次啟動、資料表全空時，把原本寫死的內容灌進資料庫一次，之後就都用資料庫版本"""
@@ -188,6 +190,10 @@ def _seed_defaults_if_empty():
                 for w in DEFAULT_SENSITIVE_KEYWORDS:
                     cur.execute("INSERT IGNORE INTO sensitive_words (word) VALUES (%s)", (w,))
             cur.execute("INSERT IGNORE INTO bot_settings (`key`, `value`) VALUES ('bot_enabled', '1')")
+            cur.execute(
+                "INSERT IGNORE INTO bot_settings (`key`, `value`) VALUES ('maintenance_message', %s)",
+                (DEFAULT_MAINTENANCE_MESSAGE,)
+            )
     except Exception as e:
         print(f"⚠️ 預設資料灌入失敗（若資料表尚未建立，請先執行 migration.sql）: {e}", flush=True)
 
@@ -196,9 +202,10 @@ def _refresh_cache_if_stale():
         return
     try:
         with db_cursor() as cur:
-            cur.execute("SELECT `value` FROM bot_settings WHERE `key`='bot_enabled'")
-            row = cur.fetchone()
-            _cache["bot_enabled"] = (row is None) or (row["value"] == "1")
+            cur.execute("SELECT `key`, `value` FROM bot_settings WHERE `key` IN ('bot_enabled', 'maintenance_message')")
+            settings_rows = {r["key"]: r["value"] for r in cur.fetchall()}
+            _cache["bot_enabled"] = settings_rows.get("bot_enabled", "1") == "1"
+            _cache["maintenance_message"] = settings_rows.get("maintenance_message") or DEFAULT_MAINTENANCE_MESSAGE
 
             cur.execute("SELECT keyword, reply_text FROM keyword_replies WHERE enabled=1")
             _cache["keyword_replies"] = {r["keyword"]: r["reply_text"] for r in cur.fetchall()}
@@ -221,6 +228,23 @@ def get_keyword_replies() -> dict:
 def get_sensitive_words() -> list:
     _refresh_cache_if_stale()
     return _cache["sensitive_words"]
+
+def get_maintenance_message() -> str:
+    _refresh_cache_if_stale()
+    return _cache["maintenance_message"] or DEFAULT_MAINTENANCE_MESSAGE
+
+def log_stat_event(event_type: str, target_id: str = None):
+    """統計用事件記錄：機器人回覆則數、敏感詞觸發則數，供中控後台總覽頁使用"""
+    if not DB_READY:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "INSERT INTO stat_events (event_type, target_id) VALUES (%s, %s)",
+                (event_type, target_id)
+            )
+    except Exception:
+        pass  # 統計記錄失敗不影響主流程
 
 def log_error(source: str, message: str, target_id: str = None):
     """統一錯誤記錄：畫面上印出來方便看 log，同時寫進 error_logs 表供中控後台檢視"""
@@ -276,6 +300,7 @@ def send_line_reply(reply_token: str, text: str):
             MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
             )
+        log_stat_event("reply")
     except Exception as e:
         log_error("LINE回覆", e)
 
@@ -381,7 +406,9 @@ def handle_line_events_safe(body_str: str, signature: str):
 @line_handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
     if not DB_READY: return
-    if not is_bot_enabled(): return  # 🔴 中控後台的「全域開關」關閉時，機器人直接靜默不回應
+    if not is_bot_enabled():
+        send_line_reply(event.reply_token, get_maintenance_message())
+        return
 
     user_text = event.message.text.strip()
     creator_id = event.source.user_id 
@@ -591,6 +618,7 @@ def handle_text_message(event):
 
     for kw in get_sensitive_words():
         if kw in clean_text:
+            log_stat_event("sensitive_block", target_id)
             send_line_reply(reply_token, "🤖 米粒為純財務助理，請勿探討敏感議題喔！")
             return
 
