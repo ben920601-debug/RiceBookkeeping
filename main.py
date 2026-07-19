@@ -8,6 +8,7 @@ import asyncio
 import httpx
 import certifi
 from datetime import datetime, timedelta
+from urllib.parse import unquote
 from contextlib import contextmanager
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import Response
@@ -601,8 +602,9 @@ def estimate_travel_minutes(distance_km: float, mode: str = "drive") -> int:
 # 🧳 7. 旅行模式：多輪對話式行程規劃
 # ------------------------------------------
 # 流程：旅行模式 → 問出發時間 → 問回程時間 → 建立草案
-#      → 逐筆輸入「日期時間 地點」→ 解析(regex優先,失敗交AI) → 地點確認 → 登記
-#      → 輸入「結束」→ AI給路線總覽建議 → 使用者「確定」或描述修改內容
+#      → 逐則輸入地點（地名或Google地圖連結，無須附時間）→ 輸入「結束」
+#      → AI 一次判斷拜訪順序並分配時間（無閒聊，直接給結果）
+#      → 使用者「確定」寫入資料庫，或直接描述修改內容（套用在草稿，尚未寫入DB）
 #      → 確定後以出發日期作為旅行單號，之後可用「旅行修改 單號」重新進入編輯
 # ==========================================
 DATETIME_PATTERN_COLON = re.compile(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})')
@@ -611,7 +613,7 @@ TRIP_MODIFY_PATTERN = re.compile(r'^旅行修改\s*[+＋]?\s*(\d{6,20}(?:-\d+)?)
 
 def parse_datetime_prefix(text: str):
     """嘗試從文字開頭解析日期時間（支援「YYYY-MM-DD HH:MM」與「YYYY/M/D HHMM」兩種格式），
-    回傳 (datetime, 剩餘文字)；解析不到回傳 (None, None)"""
+    回傳 (datetime, 剩餘文字)；解析不到回傳 (None, None)。用於出發/回程時間輸入。"""
     text = text.strip()
     m = DATETIME_PATTERN_COLON.match(text)
     if m:
@@ -634,7 +636,7 @@ class SimpleDateTimeExtraction(BaseModel):
     recognized: bool = Field(default=False)
 
 def ai_extract_datetime_only(text: str):
-    """交由 Gemini 判讀日期時間（規則沒抓到格式時的備援）"""
+    """交由 Gemini 判讀日期時間（規則沒抓到格式時的備援，僅用於出發/回程時間）"""
     prompt = (
         f"請從這段文字判讀出一個日期時間，用「YYYY-MM-DD HH:MM」24小時制格式回傳。"
         f"若文字只提到時間、沒提到日期，可合理推斷為最近的未來日期。若完全無法判讀請將 recognized 設為 false。\n"
@@ -654,35 +656,6 @@ def ai_extract_datetime_only(text: str):
         log_error("AI日期時間辨識", e)
     return None
 
-class ItineraryItemExtraction(BaseModel):
-    datetime_str: str = Field(default="")
-    location_name: str = Field(default="")
-    recognized: bool = Field(default=False)
-
-def ai_extract_itinerary_item(text: str):
-    """交由 Gemini 同時判讀「日期時間」與「地點」（規則沒抓到格式時的備援，也用於處理 Google 地圖連結）"""
-    prompt = (
-        f"請從這段文字中判讀出「日期時間」與「地點」。日期時間請用「YYYY-MM-DD HH:MM」24小時制格式回傳；"
-        f"若文字中包含 Google 地圖連結或不完整地址，請盡量判斷出實際地點名稱（店家名稱、地標或地址）。"
-        f"若完全無法判讀日期時間，請將 recognized 設為 false。\n"
-        f"目前時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n文字：『{text}』"
-    )
-    try:
-        result = ai_client.models.generate_content(
-            model='gemini-2.5-flash', contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=ItineraryItemExtraction, temperature=0.1),
-        ).parsed
-        if result and result.recognized:
-            dt = None
-            try:
-                dt = datetime.strptime(result.datetime_str, "%Y-%m-%d %H:%M")
-            except Exception:
-                dt = None
-            return dt, (result.location_name.strip() if result.location_name else None)
-    except Exception as e:
-        log_error("AI行程項目辨識", e)
-    return None, None
-
 def is_maps_url(text: str) -> bool:
     return bool(re.search(r'(maps\.google|goo\.gl/maps|maps\.app\.goo\.gl|google\.com/maps)', text, re.IGNORECASE))
 
@@ -695,6 +668,42 @@ def try_extract_latlon_from_url(text: str):
     if m:
         return float(m.group(1)), float(m.group(2))
     return None, None
+
+def resolve_maps_url(text: str) -> str:
+    """把 Google 地圖短網址展開成完整網址。短網址（goo.gl/maps、maps.app.goo.gl）本身
+    不含任何店名或座標資訊，必須實際發送請求跟隨轉址才能拿到真正的目的地網址，
+    這是先前「AI 分辨不出來」的根本原因 —— 之前只是把短網址原文丟給 AI 猜，AI 當然猜不出來。"""
+    urls = re.findall(r'https?://\S+', text)
+    url = urls[0] if urls else text.strip()
+    try:
+        res = httpx.get(url, follow_redirects=True, timeout=8.0, verify=certifi.where())
+        return str(res.url)
+    except Exception as e:
+        log_error("地圖網址展開", e)
+        return url
+
+def extract_place_name_from_url(url: str):
+    """從展開後的完整網址取得店名，例如 .../maps/place/台北101/@25.03,121.56,17z/..."""
+    m = re.search(r'/maps/place/([^/@]+)', url)
+    if m:
+        return unquote(m.group(1)).replace('+', ' ')
+    return None
+
+def resolve_location_input(text: str):
+    """統一的地點輸入解析入口：回傳 (location_name, lat, lon)。
+    是 Google 地圖網址就展開短網址取得店名與座標；不是網址就直接當地名做地理編碼。"""
+    text = text.strip()
+    if is_maps_url(text) or text.startswith("http"):
+        resolved_url = resolve_maps_url(text)
+        lat, lon = try_extract_latlon_from_url(resolved_url)
+        name = extract_place_name_from_url(resolved_url)
+        if not name:
+            name = f"地點（{lat:.5f}, {lon:.5f}）" if lat is not None else text
+        if lat is None:
+            lat, lon = geocode_location(name)
+        return name, lat, lon
+    lat, lon = geocode_location(text)
+    return text, lat, lon
 
 # --- 旅行對話狀態（trip_sessions）存取 ---
 def get_trip_session(owner_type: str, owner_id: str):
@@ -719,31 +728,97 @@ def clear_trip_session(owner_type: str, owner_id: str):
     with db_cursor() as cur:
         cur.execute("DELETE FROM trip_sessions WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
 
-def build_trip_summary_text(trip_id: int) -> str:
+def generate_trip_code(owner_type: str, owner_id: str, departure_at: datetime) -> str:
+    base = departure_at.strftime("%Y%m%d")
     with db_cursor() as cur:
         cur.execute(
-            "SELECT scheduled_at, location_name FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC",
-            (trip_id,)
+            "SELECT COUNT(*) AS cnt FROM trips WHERE owner_type=%s AND owner_id=%s AND trip_code LIKE %s",
+            (owner_type, owner_id, f"{base}%")
         )
-        rows = cur.fetchall()
-    if not rows:
-        return "（目前尚未登記任何地點）"
-    return "\n".join(f"{i+1}. {r['scheduled_at'].strftime('%m/%d %H:%M')}　{r['location_name']}" for i, r in enumerate(rows))
+        cnt = cur.fetchone()["cnt"]
+    return base if cnt == 0 else f"{base}-{cnt + 1}"
 
-def ai_review_trip_route(departure_at: datetime, return_at: datetime, summary_text: str) -> str:
+# --- AI 一次性安排拜訪順序與時間（取代逐項詢問，且不含任何閒聊） ---
+class TripStopPlan(BaseModel):
+    original_index: int = Field(default=0)
+    datetime_str: str = Field(default="")
+
+class TripArrangement(BaseModel):
+    stops: List[TripStopPlan] = Field(default_factory=list)
+
+def ai_arrange_trip(departure_at: datetime, return_at: datetime, locations: list) -> list:
+    """locations: [{"location_name","lat","lon"}, ...]（無序、無時間）
+    回傳依建議順序排列、並附上建議時間的清單：[{"location_name","lat","lon","scheduled_at"(ISO字串)}, ...]
+    務必保證涵蓋所有輸入地點，AI若遺漏會由程式碼兜底補上，不會憑空遺失使用者輸入的地點。"""
+    loc_lines = []
+    for i, l in enumerate(locations):
+        coord_note = f"（座標：{l['lat']:.4f},{l['lon']:.4f}）" if l.get("lat") is not None else ""
+        loc_lines.append(f"{i + 1}. {l['location_name']}{coord_note}")
     prompt = (
-        f"這是一趟旅行的行程安排，出發時間：{departure_at.strftime('%Y-%m-%d %H:%M')}，"
-        f"回程時間：{return_at.strftime('%Y-%m-%d %H:%M')}。行程列表：\n{summary_text}\n\n"
-        f"請用簡短親切的口吻（3-5句話內），評論這個行程安排是否合理（例如時間會不會太趕、順序是否需要調整），"
-        f"若有明顯問題請具體指出，沒有問題就給予正面回饋即可。"
+        f"這是一趟旅行，出發時間：{departure_at.strftime('%Y-%m-%d %H:%M')}，"
+        f"回程時間：{return_at.strftime('%Y-%m-%d %H:%M')}。\n"
+        f"以下是使用者提供的地點（編號僅為輸入順序，不代表拜訪順序）：\n" + "\n".join(loc_lines) + "\n\n"
+        f"請安排一個合理的拜訪順序，並給每個地點分配具體到達時間（YYYY-MM-DD HH:MM），"
+        f"時間需介於出發與回程之間，並依地點間距離給予合理間隔（至少間隔1小時，跨天則安排在適當時段）。"
+        f"stops 陣列的排列順序就是建議的拜訪順序，每個元素的 original_index 對應到上面的編號，"
+        f"務必涵蓋全部 {len(locations)} 個地點，不可遺漏或重複。"
     )
+    arranged = []
+    used_indices = set()
     try:
-        result = ai_client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-        return (result.text or "").strip() or "行程看起來安排得不錯！"
+        result = ai_client.models.generate_content(
+            model='gemini-2.5-flash', contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TripArrangement, temperature=0.2),
+        ).parsed
+        if result and result.stops:
+            for stop in result.stops:
+                idx = stop.original_index - 1
+                if 0 <= idx < len(locations) and idx not in used_indices:
+                    try:
+                        dt = datetime.strptime(stop.datetime_str, "%Y-%m-%d %H:%M")
+                    except Exception:
+                        continue
+                    loc = locations[idx]
+                    arranged.append({"location_name": loc["location_name"], "lat": loc.get("lat"), "lon": loc.get("lon"), "scheduled_at": dt.isoformat()})
+                    used_indices.add(idx)
     except Exception as e:
-        log_error("AI路線建議", e)
-        return "（AI路線建議暫時無法取得，不影響行程登記）"
+        log_error("AI旅行安排", e)
 
+    # 兜底：AI 若遺漏或整個判讀失敗，把沒被安排到的地點依序補在最後，時間平均分配於出發~回程之間
+    missing = [i for i in range(len(locations)) if i not in used_indices]
+    if missing:
+        span_seconds = max(3600.0, (return_at - departure_at).total_seconds())
+        step = span_seconds / (len(missing) + 1)
+        base_dt = datetime.fromisoformat(arranged[-1]["scheduled_at"]) if arranged else departure_at
+        for n, idx in enumerate(missing, start=1):
+            loc = locations[idx]
+            dt = base_dt + timedelta(seconds=step * n)
+            if dt > return_at:
+                dt = return_at
+            arranged.append({"location_name": loc["location_name"], "lat": loc.get("lat"), "lon": loc.get("lon"), "scheduled_at": dt.isoformat()})
+
+    arranged.sort(key=lambda x: x["scheduled_at"])
+    return arranged
+
+def build_draft_summary_text(arranged: list) -> str:
+    if not arranged:
+        return "（目前尚未安排任何地點）"
+    lines = []
+    for i, a in enumerate(arranged):
+        dt = datetime.fromisoformat(a["scheduled_at"])
+        lines.append(f"{i + 1}. {dt.strftime('%m/%d %H:%M')}　{a['location_name']}")
+    return "\n".join(lines)
+
+def send_trip_review_draft(arranged: list, reply_token: str):
+    """顯示AI安排結果，直接給結果、不加任何閒聊評論"""
+    summary = build_draft_summary_text(arranged)
+    send_line_reply(
+        reply_token,
+        f"🗺️ 【AI安排結果】\n{summary}\n\n"
+        f"回覆「確定」完成規劃並寫入資料庫，或直接輸入想修改的內容（例如：把第2項改成15:00、刪除第3項、新增 台北101）。"
+    )
+
+# --- 修改指示的 AI 判讀（套用在草稿上，尚未寫入資料庫） ---
 class TripModification(BaseModel):
     action: Literal["edit", "delete", "add", "update_times", "unclear"] = Field(default="unclear")
     target_index: Optional[int] = Field(default=None)
@@ -754,13 +829,13 @@ class TripModification(BaseModel):
 
 def ai_apply_trip_modification(summary_text: str, departure_at: datetime, return_at: datetime, user_text: str) -> TripModification:
     prompt = (
-        f"目前旅行行程如下（編號. 時間 地點）：\n{summary_text}\n"
+        f"目前旅行行程草稿如下（編號. 時間 地點）：\n{summary_text}\n"
         f"出發時間：{departure_at.strftime('%Y-%m-%d %H:%M')}，回程時間：{return_at.strftime('%Y-%m-%d %H:%M')}\n\n"
         f"使用者想這樣修改：『{user_text}』\n\n"
         f"請判斷這是以下哪一種操作，並填入對應欄位（用不到的欄位留空字串）：\n"
         f"- edit：修改某一項的時間或地點（填 target_index，以及要改的 new_datetime_str 和/或 new_location）\n"
         f"- delete：刪除某一項（填 target_index）\n"
-        f"- add：新增一項（填 new_datetime_str 與 new_location）\n"
+        f"- add：新增一項（填 new_location，new_datetime_str 可留空由系統自動安排）\n"
         f"- update_times：修改整趟旅行的出發/回程時間（填 new_departure_str 和/或 new_return_str）\n"
         f"- unclear：看不懂使用者想做什麼\n"
         f"日期時間格式一律用「YYYY-MM-DD HH:MM」24小時制。"
@@ -774,31 +849,6 @@ def ai_apply_trip_modification(summary_text: str, departure_at: datetime, return
     except Exception as e:
         log_error("AI旅行修改判讀", e)
         return TripModification()
-
-def generate_trip_code(owner_type: str, owner_id: str, departure_at: datetime) -> str:
-    base = departure_at.strftime("%Y%m%d")
-    with db_cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) AS cnt FROM trips WHERE owner_type=%s AND owner_id=%s AND trip_code LIKE %s",
-            (owner_type, owner_id, f"{base}%")
-        )
-        cnt = cur.fetchone()["cnt"]
-    return base if cnt == 0 else f"{base}-{cnt + 1}"
-
-def send_trip_review(owner_type: str, owner_id: str, trip: dict, reply_token: str):
-    summary = build_trip_summary_text(trip["id"])
-    ai_summary = ai_review_trip_route(trip["departure_at"], trip["return_at"], summary)
-    try:
-        with db_cursor() as cur:
-            cur.execute("UPDATE trips SET ai_route_summary=%s WHERE id=%s", (ai_summary, trip["id"]))
-    except Exception as e:
-        log_error("旅行路線建議寫入", e, owner_id)
-    set_trip_session(owner_type, owner_id, "pending_review", trip_id=trip["id"])
-    send_line_reply(
-        reply_token,
-        f"🗺️ 【行程總覽】\n{summary}\n\n🤖 AI建議：{ai_summary}\n\n"
-        f"這樣安排OK嗎？回覆「確定」完成規劃並取得旅行單號，或直接輸入想修改的內容（例如：把第2項改成15:00 台北101、刪除第3項）。"
-    )
 
 def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_text: str, reply_token: str) -> bool:
     """旅行模式的多輪對話總路由。回傳 True 代表這則訊息已被旅行流程處理完畢。"""
@@ -819,7 +869,7 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
         send_line_reply(reply_token, "🚫 已取消本次旅行規劃。")
         return True
 
-    # 「旅行修改 單號」：重新進入某趟已完成旅行的編輯
+    # 「旅行修改 單號」：把既有旅行（不論是否已確認）的行程項目載入草稿，重新進入編輯
     m = TRIP_MODIFY_PATTERN.match(clean_text)
     if m and not session:
         trip_code = m.group(1)
@@ -837,7 +887,25 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
         if not trip:
             send_line_reply(reply_token, f"❌ 找不到旅行單號 #{trip_code}，請確認號碼是否正確。")
             return True
-        send_trip_review(owner_type, owner_id, trip, reply_token)
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT scheduled_at, location_name, latitude, longitude FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC",
+                    (trip["id"],)
+                )
+                rows = cur.fetchall()
+        except Exception as e:
+            log_error("旅行修改-載入項目", e, owner_id)
+            send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
+            return True
+        arranged = [{
+            "location_name": r["location_name"],
+            "lat": float(r["latitude"]) if r["latitude"] is not None else None,
+            "lon": float(r["longitude"]) if r["longitude"] is not None else None,
+            "scheduled_at": r["scheduled_at"].isoformat(),
+        } for r in rows]
+        set_trip_session(owner_type, owner_id, "pending_review", trip_id=trip["id"], draft={"arranged": arranged})
+        send_trip_review_draft(arranged, reply_token)
         return True
 
     # 觸發詞：開始一趟新旅行（前提：目前沒有進行中的規劃對話）
@@ -895,20 +963,24 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
             send_line_reply(reply_token, "⚠️ 旅行建立失敗，請稍後再試一次。")
             return True
 
-        set_trip_session(owner_type, owner_id, "collecting", trip_id=trip_pk)
+        set_trip_session(owner_type, owner_id, "collecting", trip_id=trip_pk, draft={"locations": []})
         send_line_reply(
             reply_token,
             f"✅ 已建立旅行草案！\n📅 {departure_at.strftime('%Y-%m-%d %H:%M')} → {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"請開始輸入行程地點，格式：日期時間 地點，例如：\n2026-07-19 20:00 台北101\n（也可以直接貼 Google 地圖連結）\n\n"
-            f"全部輸入完畢後，請輸入「結束」進行總覽確認。"
+            f"請依序輸入想去的地點（貼 Google 地圖連結，或直接輸入地名/地址皆可，不用附時間）。\n"
+            f"全部輸入完畢後，請輸入「結束」，我會直接安排拜訪順序與時間。"
         )
         return True
 
-    # --- Stage 3：收集行程地點 ---
+    # --- Stage 3：收集地點（無須時間、無須逐項確認） ---
     if stage == "collecting":
         trip_id = session["trip_id"]
+        draft = json.loads(session["draft_json"] or '{"locations": []}')
 
         if clean_text in ("結束", "完成", "結束規劃"):
+            if not draft.get("locations"):
+                send_line_reply(reply_token, "⚠️ 目前還沒有任何地點，請先輸入至少一個地點（Google 地圖連結或地名皆可）。")
+                return True
             try:
                 with db_cursor() as cur:
                     cur.execute("SELECT * FROM trips WHERE id=%s", (trip_id,))
@@ -917,88 +989,27 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
                 log_error("旅行查詢", e, owner_id)
                 send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
                 return True
-            send_trip_review(owner_type, owner_id, trip, reply_token)
+            arranged = ai_arrange_trip(trip["departure_at"], trip["return_at"], draft["locations"])
+            draft["arranged"] = arranged
+            set_trip_session(owner_type, owner_id, "pending_review", trip_id=trip_id, draft=draft)
+            send_trip_review_draft(arranged, reply_token)
             return True
 
-        dt, remainder = parse_datetime_prefix(clean_text)
-        location_text = remainder
-        maps_lat, maps_lon = (None, None)
-        if dt is None or not remainder:
-            if is_maps_url(clean_text):
-                maps_lat, maps_lon = try_extract_latlon_from_url(clean_text)
-            ai_dt, ai_loc = ai_extract_itinerary_item(clean_text)
-            dt = dt or ai_dt
-            location_text = location_text or ai_loc
-
-        if dt is None or not location_text:
-            send_line_reply(
-                reply_token,
-                "⚠️ 看不懂日期時間或地點，請用「日期時間 地點」格式再試一次，例如：\n2026-07-19 20:00 台北101\n或輸入「結束」完成規劃。"
-            )
-            return True
-
-        if maps_lat is not None:
-            lat, lon = maps_lat, maps_lon
-        else:
-            lat, lon = geocode_location(location_text)
-
-        draft = {"scheduled_at": dt.isoformat(), "location_name": location_text, "lat": lat, "lon": lon}
-        set_trip_session(owner_type, owner_id, "pending_location_confirm", trip_id=trip_id, draft=draft)
-        geo_note = "" if lat is not None else "\n⚠️ 這個地點沒有查到座標，將不會有通勤估算，但仍可正常登記。"
+        name, lat, lon = resolve_location_input(clean_text)
+        draft.setdefault("locations", []).append({"location_name": name, "lat": lat, "lon": lon})
+        set_trip_session(owner_type, owner_id, "collecting", trip_id=trip_id, draft=draft)
+        geo_note = "" if lat is not None else "（座標查詢失敗，仍會加入，不影響後續安排）"
         send_line_reply(
             reply_token,
-            f"📍 地點解讀為：「{location_text}」\n🕒 {dt.strftime('%m/%d %H:%M')}\n"
-            f"這樣正確嗎？回覆「對」確認登記，或直接重新輸入地點名稱修正。{geo_note}"
+            f"📍 已加入：{name}{geo_note}（目前共 {len(draft['locations'])} 個地點）\n繼續輸入下一個地點，或輸入「結束」開始安排。"
         )
         return True
 
-    # --- Stage 4：等待地點確認 ---
-    if stage == "pending_location_confirm":
-        draft = json.loads(session["draft_json"] or "{}")
-        trip_id = session["trip_id"]
-
-        if any(k in clean_text for k in ["對", "是", "正確", "沒錯", "confirm", "OK", "ok"]):
-            dt = datetime.fromisoformat(draft["scheduled_at"])
-            try:
-                with db_cursor() as cur:
-                    cur.execute(
-                        """INSERT INTO itineraries
-                           (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (owner_type, owner_id, trip_id, dt, draft["location_name"], draft.get("lat"), draft.get("lon"), creator_id)
-                    )
-            except Exception as e:
-                log_error("行程項目登記", e, owner_id)
-                send_line_reply(reply_token, "⚠️ 登記失敗，請稍後再試一次。")
-                return True
-            set_trip_session(owner_type, owner_id, "collecting", trip_id=trip_id)
-            send_line_reply(reply_token, f"✅ 已登記：{dt.strftime('%m/%d %H:%M')} {draft['location_name']}\n請繼續輸入下一個行程，或輸入「結束」完成規劃。")
-            return True
-
-        # 不是確認回覆 → 當作重新輸入的地點名稱，沿用原本的日期時間重新解析
-        new_location_text = clean_text
-        maps_lat, maps_lon = (None, None)
-        if is_maps_url(new_location_text):
-            maps_lat, maps_lon = try_extract_latlon_from_url(new_location_text)
-            ai_loc = ai_extract_location_name(new_location_text) if maps_lat is None else None
-            if ai_loc:
-                new_location_text = ai_loc
-        lat, lon = (maps_lat, maps_lon) if maps_lat is not None else geocode_location(new_location_text)
-
-        draft.update({"location_name": new_location_text, "lat": lat, "lon": lon})
-        set_trip_session(owner_type, owner_id, "pending_location_confirm", trip_id=trip_id, draft=draft)
-        dt = datetime.fromisoformat(draft["scheduled_at"])
-        geo_note = "" if lat is not None else "\n⚠️ 這個地點沒有查到座標，將不會有通勤估算，但仍可正常登記。"
-        send_line_reply(
-            reply_token,
-            f"📍 地點解讀為：「{new_location_text}」\n🕒 {dt.strftime('%m/%d %H:%M')}\n"
-            f"這樣正確嗎？回覆「對」確認登記，或直接重新輸入地點名稱修正。{geo_note}"
-        )
-        return True
-
-    # --- Stage 5：等待總覽確認或修改指示 ---
+    # --- Stage 4：等待總覽確認或修改指示（作用於草稿，尚未寫入資料庫） ---
     if stage == "pending_review":
         trip_id = session["trip_id"]
+        draft = json.loads(session["draft_json"] or "{}")
+        arranged = draft.get("arranged", [])
         try:
             with db_cursor() as cur:
                 cur.execute("SELECT * FROM trips WHERE id=%s", (trip_id,))
@@ -1012,17 +1023,21 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
             return False
 
         if any(k in clean_text for k in ["確定", "OK", "ok", "沒問題", "可以"]):
-            if trip["status"] != "confirmed":
-                trip_code = generate_trip_code(owner_type, owner_id, trip["departure_at"])
-                try:
-                    with db_cursor() as cur:
-                        cur.execute("UPDATE trips SET status='confirmed', trip_code=%s WHERE id=%s", (trip_code, trip_id))
-                except Exception as e:
-                    log_error("旅行確認寫入", e, owner_id)
-                    send_line_reply(reply_token, "⚠️ 確認失敗，請稍後再試一次。")
-                    return True
-            else:
-                trip_code = trip["trip_code"]
+            trip_code = trip["trip_code"] if trip["status"] == "confirmed" else generate_trip_code(owner_type, owner_id, trip["departure_at"])
+            try:
+                with db_cursor() as cur:
+                    cur.execute("DELETE FROM itineraries WHERE trip_id=%s", (trip_id,))
+                    for a in arranged:
+                        cur.execute(
+                            """INSERT INTO itineraries (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                            (owner_type, owner_id, trip_id, datetime.fromisoformat(a["scheduled_at"]), a["location_name"], a.get("lat"), a.get("lon"), creator_id)
+                        )
+                    cur.execute("UPDATE trips SET status='confirmed', trip_code=%s WHERE id=%s", (trip_code, trip_id))
+            except Exception as e:
+                log_error("旅行確認寫入", e, owner_id)
+                send_line_reply(reply_token, "⚠️ 確認失敗，請稍後再試一次。")
+                return True
             clear_trip_session(owner_type, owner_id)
             send_line_reply(
                 reply_token,
@@ -1031,87 +1046,51 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
             )
             return True
 
-        # 其餘文字視為修改指示，交給 AI 判讀
-        summary = build_trip_summary_text(trip_id)
+        # 其餘文字視為修改指示，交給 AI 判讀，套用在草稿（尚未寫入資料庫）
+        summary = build_draft_summary_text(arranged)
         mod = ai_apply_trip_modification(summary, trip["departure_at"], trip["return_at"], clean_text)
 
-        if mod.action == "delete" and mod.target_index:
+        if mod.action == "delete" and mod.target_index and 1 <= mod.target_index <= len(arranged):
+            arranged.pop(mod.target_index - 1)
+        elif mod.action == "edit" and mod.target_index and 1 <= mod.target_index <= len(arranged):
+            target = arranged[mod.target_index - 1]
+            if mod.new_datetime_str:
+                try:
+                    target["scheduled_at"] = datetime.strptime(mod.new_datetime_str, "%Y-%m-%d %H:%M").isoformat()
+                except Exception:
+                    pass
+            if mod.new_location:
+                name, lat, lon = resolve_location_input(mod.new_location)
+                target["location_name"], target["lat"], target["lon"] = name, lat, lon
+            arranged.sort(key=lambda x: x["scheduled_at"])
+        elif mod.action == "add" and mod.new_location:
+            name, lat, lon = resolve_location_input(mod.new_location)
             try:
-                with db_cursor() as cur:
-                    cur.execute("SELECT id FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC", (trip_id,))
-                    rows = cur.fetchall()
-                    if 1 <= mod.target_index <= len(rows):
-                        cur.execute("DELETE FROM itineraries WHERE id=%s", (rows[mod.target_index - 1]["id"],))
-            except Exception as e:
-                log_error("旅行修改-刪除", e, owner_id)
-
-        elif mod.action == "edit" and mod.target_index:
-            try:
-                with db_cursor() as cur:
-                    cur.execute("SELECT id, scheduled_at, location_name FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC", (trip_id,))
-                    rows = cur.fetchall()
-                    if 1 <= mod.target_index <= len(rows):
-                        target = rows[mod.target_index - 1]
-                        new_dt = target["scheduled_at"]
-                        new_loc = target["location_name"]
-                        if mod.new_datetime_str:
-                            try:
-                                new_dt = datetime.strptime(mod.new_datetime_str, "%Y-%m-%d %H:%M")
-                            except Exception:
-                                pass
-                        if mod.new_location:
-                            new_loc = mod.new_location
-                        lat, lon = geocode_location(new_loc) if mod.new_location else (None, None)
-                        if mod.new_location:
-                            cur.execute("UPDATE itineraries SET scheduled_at=%s, location_name=%s, latitude=%s, longitude=%s, notified=0 WHERE id=%s",
-                                        (new_dt, new_loc, lat, lon, target["id"]))
-                        else:
-                            cur.execute("UPDATE itineraries SET scheduled_at=%s, notified=0 WHERE id=%s", (new_dt, target["id"]))
-            except Exception as e:
-                log_error("旅行修改-編輯", e, owner_id)
-
-        elif mod.action == "add" and mod.new_datetime_str and mod.new_location:
-            try:
-                new_dt = datetime.strptime(mod.new_datetime_str, "%Y-%m-%d %H:%M")
-                lat, lon = geocode_location(mod.new_location)
-                with db_cursor() as cur:
-                    cur.execute(
-                        """INSERT INTO itineraries (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (owner_type, owner_id, trip_id, new_dt, mod.new_location, lat, lon, creator_id)
-                    )
-            except Exception as e:
-                log_error("旅行修改-新增", e, owner_id)
-
+                dt = datetime.strptime(mod.new_datetime_str, "%Y-%m-%d %H:%M") if mod.new_datetime_str else trip["departure_at"]
+            except Exception:
+                dt = trip["departure_at"]
+            arranged.append({"location_name": name, "lat": lat, "lon": lon, "scheduled_at": dt.isoformat()})
+            arranged.sort(key=lambda x: x["scheduled_at"])
         elif mod.action == "update_times":
             try:
                 new_dep = datetime.strptime(mod.new_departure_str, "%Y-%m-%d %H:%M") if mod.new_departure_str else trip["departure_at"]
                 new_ret = datetime.strptime(mod.new_return_str, "%Y-%m-%d %H:%M") if mod.new_return_str else trip["return_at"]
                 with db_cursor() as cur:
                     cur.execute("UPDATE trips SET departure_at=%s, return_at=%s WHERE id=%s", (new_dep, new_ret, trip_id))
+                trip["departure_at"], trip["return_at"] = new_dep, new_ret
             except Exception as e:
                 log_error("旅行修改-時間", e, owner_id)
-
         else:
-            send_line_reply(reply_token, "⚠️ 不太確定您要修改的內容，請具體描述，例如：「把第2項改成15:00 台北101」「刪除第3項」「新增 2026-07-20 09:00 早餐店」。")
+            send_line_reply(reply_token, "⚠️ 不太確定您要修改的內容，請具體描述，例如：「把第2項改成15:00」「刪除第3項」「新增 台北101」。")
             return True
 
-        try:
-            with db_cursor() as cur:
-                cur.execute("SELECT * FROM trips WHERE id=%s", (trip_id,))
-                trip = cur.fetchone()
-        except Exception as e:
-            log_error("旅行查詢", e, owner_id)
-            return True
-        send_trip_review(owner_type, owner_id, trip, reply_token)
+        draft["arranged"] = arranged
+        set_trip_session(owner_type, owner_id, "pending_review", trip_id=trip_id, draft=draft)
+        send_trip_review_draft(arranged, reply_token)
         return True
 
     return False
 
-def ai_extract_location_name(text: str):
-    """輔助函式：僅需要地點名稱時使用（例如地點確認階段重新輸入 Google 地圖連結）"""
-    _, loc = ai_extract_itinerary_item(text)
-    return loc
 
 def send_itinerary_reminder(it: dict):
     owner_type = it["owner_type"]
@@ -2262,6 +2241,172 @@ def api_delete_order(group_id: str, order_id: int):
         with db_cursor() as cur:
             cur.execute("DELETE FROM order_items WHERE order_id=%s AND group_id=%s", (order_id, group_id))
             cur.execute("DELETE FROM orders WHERE id=%s AND group_id=%s", (order_id, group_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 🧳 旅行功能 REST API（BETA，供 index.html 顯示/增減修正旅行規劃）
+# ==========================================
+class TripCreate(BaseModel):
+    owner_type: Literal["user", "group"]
+    owner_id: str
+    departure_at: str  # "YYYY-MM-DD HH:MM"
+    return_at: str
+
+class TripTimesUpdate(BaseModel):
+    departure_at: str
+    return_at: str
+
+class ItineraryItemCreate(BaseModel):
+    scheduled_at: str  # "YYYY-MM-DD HH:MM"
+    location_name: str
+
+class ItineraryItemUpdate(BaseModel):
+    scheduled_at: str
+    location_name: str
+
+def _parse_dt(s: str) -> datetime:
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期時間格式錯誤，請用 YYYY-MM-DD HH:MM")
+
+@app.get("/api/trips")
+def api_list_trips(owner_type: Literal["user", "group"], owner_id: str):
+    """列出該使用者/群組的所有旅行（含已完成規劃與進行中的草案），並附上每趟旅行的行程項目明細"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT id, trip_code, departure_at, return_at, status, ai_route_summary, created_at
+                   FROM trips WHERE owner_type=%s AND owner_id=%s ORDER BY departure_at DESC""",
+                (owner_type, owner_id)
+            )
+            trips = cur.fetchall()
+            for t in trips:
+                cur.execute(
+                    "SELECT id, scheduled_at, location_name, notified FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC",
+                    (t["id"],)
+                )
+                items = cur.fetchall()
+                for it in items:
+                    it["scheduled_at"] = it["scheduled_at"].isoformat()
+                t["items"] = items
+                t["departure_at"] = t["departure_at"].isoformat()
+                t["return_at"] = t["return_at"].isoformat()
+                t["created_at"] = t["created_at"].isoformat()
+        return trips
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/trips")
+def api_create_trip(body: TripCreate):
+    """中控後台直接新增一趟旅行（不經過 LINE 對話流程），建立時即視為已確認並產生旅行單號"""
+    _require_db()
+    departure_at = _parse_dt(body.departure_at)
+    return_at = _parse_dt(body.return_at)
+    if return_at <= departure_at:
+        raise HTTPException(status_code=400, detail="回程時間必須晚於出發時間")
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO trips (owner_type, owner_id, departure_at, return_at, status, created_by_uid)
+                   VALUES (%s, %s, %s, %s, 'collecting', 'admin-panel')""",
+                (body.owner_type, body.owner_id, departure_at, return_at)
+            )
+            trip_id = cur.lastrowid
+            trip_code = departure_at.strftime("%Y%m%d")
+            cur.execute("SELECT COUNT(*) AS cnt FROM trips WHERE owner_type=%s AND owner_id=%s AND trip_code LIKE %s",
+                        (body.owner_type, body.owner_id, f"{trip_code}%"))
+            cnt = cur.fetchone()["cnt"]
+            if cnt > 0:
+                trip_code = f"{trip_code}-{cnt + 1}"
+            cur.execute("UPDATE trips SET status='confirmed', trip_code=%s WHERE id=%s", (trip_code, trip_id))
+        return {"ok": True, "id": trip_id, "trip_code": trip_code}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/trips/{trip_id}")
+def api_update_trip_times(trip_id: int, body: TripTimesUpdate):
+    """編輯一趟旅行的出發／回程時間"""
+    _require_db()
+    departure_at = _parse_dt(body.departure_at)
+    return_at = _parse_dt(body.return_at)
+    if return_at <= departure_at:
+        raise HTTPException(status_code=400, detail="回程時間必須晚於出發時間")
+    try:
+        with db_cursor() as cur:
+            cur.execute("UPDATE trips SET departure_at=%s, return_at=%s WHERE id=%s", (departure_at, return_at, trip_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/trips/{trip_id}")
+def api_delete_trip(trip_id: int):
+    """刪除一趟旅行（含底下所有行程項目，靠外鍵 CASCADE 一併清除）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM trips WHERE id=%s", (trip_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/trips/{trip_id}/items")
+def api_add_trip_item(trip_id: int, body: ItineraryItemCreate):
+    """新增一個行程項目到指定旅行（座標會自動地理編碼，查不到也不影響新增）"""
+    _require_db()
+    scheduled_at = _parse_dt(body.scheduled_at)
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT owner_type, owner_id FROM trips WHERE id=%s", (trip_id,))
+            trip = cur.fetchone()
+            if not trip:
+                raise HTTPException(status_code=404, detail="找不到此旅行")
+            lat, lon = geocode_location(body.location_name)
+            cur.execute(
+                """INSERT INTO itineraries (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'admin-panel')""",
+                (trip["owner_type"], trip["owner_id"], trip_id, scheduled_at, body.location_name.strip(), lat, lon)
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/itinerary-items/{item_id}")
+def api_update_trip_item(item_id: int, body: ItineraryItemUpdate):
+    """編輯行程項目的時間／地點（地點若有變更會重新地理編碼），並重置提醒狀態"""
+    _require_db()
+    scheduled_at = _parse_dt(body.scheduled_at)
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT location_name FROM itineraries WHERE id=%s", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="找不到此行程項目")
+            if body.location_name.strip() != row["location_name"]:
+                lat, lon = geocode_location(body.location_name)
+                cur.execute(
+                    "UPDATE itineraries SET scheduled_at=%s, location_name=%s, latitude=%s, longitude=%s, notified=0 WHERE id=%s",
+                    (scheduled_at, body.location_name.strip(), lat, lon, item_id)
+                )
+            else:
+                cur.execute("UPDATE itineraries SET scheduled_at=%s, notified=0 WHERE id=%s", (scheduled_at, item_id))
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/itinerary-items/{item_id}")
+def api_delete_trip_item(item_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM itineraries WHERE id=%s", (item_id,))
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
