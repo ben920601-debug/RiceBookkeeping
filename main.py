@@ -489,15 +489,47 @@ def clear_pending_password(owner_type: str, owner_id: str):
         cur.execute("DELETE FROM test_mode_pending WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
 
 def activate_test_mode(owner_type: str, owner_id: str, feature: str):
+    """開啟指定測試模式。同一時間同一個 owner（個人或群組）只能有一個模式是開啟的，
+    避免多個模式同時監聽訊息造成資料輸入互相干擾（例如旅行模式在等地點、
+    群組團單同時在等「均分/跳過」回覆，一則訊息卻被兩邊搶著解讀）。
+    回傳 (expires, closed_feature)：closed_feature 是被自動關閉的舊模式（沒有則為 None）。"""
     expires = datetime.now() + timedelta(hours=TEST_MODE_HOURS)
+    closed_feature = None
     with db_cursor() as cur:
+        cur.execute(
+            "SELECT feature FROM test_mode_sessions WHERE owner_type=%s AND owner_id=%s AND feature<>%s AND expires_at > NOW()",
+            (owner_type, owner_id, feature)
+        )
+        others = cur.fetchall()
+        if others:
+            closed_feature = others[0]["feature"]
+            cur.execute("DELETE FROM test_mode_sessions WHERE owner_type=%s AND owner_id=%s AND feature<>%s", (owner_type, owner_id, feature))
+            # 清除其他模式殘留的對話中狀態，避免切換模式後舊的待回覆狀態還卡著
+            cur.execute("DELETE FROM trip_sessions WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
+            cur.execute("DELETE FROM pending_group_expense WHERE group_id=%s", (owner_id,))
+            cur.execute("DELETE FROM pending_receipt_naming WHERE group_id=%s", (owner_id,))
+
         cur.execute(
             """INSERT INTO test_mode_sessions (owner_type, owner_id, feature, expires_at)
                VALUES (%s, %s, %s, %s)
                ON DUPLICATE KEY UPDATE expires_at=VALUES(expires_at)""",
             (owner_type, owner_id, feature, expires)
         )
-    return expires
+    return expires, closed_feature
+
+def has_other_active_test_mode(owner_type: str, owner_id: str, feature: str) -> Optional[str]:
+    """查詢是否已經有『其他』模式正在開啟中，回傳該模式名稱；沒有則回傳 None"""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT feature FROM test_mode_sessions WHERE owner_type=%s AND owner_id=%s AND feature<>%s AND expires_at > NOW() LIMIT 1",
+                (owner_type, owner_id, feature)
+            )
+            row = cur.fetchone()
+            return row["feature"] if row else None
+    except Exception as e:
+        log_error("模式互斥檢查", e, owner_id)
+        return None
 
 def try_handle_test_mode_gate(owner_type: str, owner_id: str, clean_text: str, reply_token: str) -> bool:
     """
@@ -521,11 +553,15 @@ def try_handle_test_mode_gate(owner_type: str, owner_id: str, clean_text: str, r
             return True
         if clean_text.strip() == TEST_MODE_PASSWORD:
             clear_pending_password(owner_type, owner_id)
-            expires = activate_test_mode(owner_type, owner_id, pending_feature)
+            expires, closed_feature = activate_test_mode(owner_type, owner_id, pending_feature)
             label = TEST_FEATURE_LABELS.get(pending_feature, pending_feature)
+            closed_note = ""
+            if closed_feature:
+                closed_label = TEST_FEATURE_LABELS.get(closed_feature, closed_feature)
+                closed_note = f"\n（同一時間僅能開啟一種模式，已自動關閉原本開啟中的「{closed_label}」）"
             send_line_reply(
                 reply_token,
-                f"✅「{label}」測試模式已啟用！\n⏳ 效期至：{expires.strftime('%m/%d %H:%M')}（{TEST_MODE_HOURS} 小時後自動關閉）"
+                f"✅「{label}」測試模式已啟用！\n⏳ 效期至：{expires.strftime('%m/%d %H:%M')}（{TEST_MODE_HOURS} 小時後自動關閉）{closed_note}"
             )
         else:
             clear_pending_password(owner_type, owner_id)
@@ -602,7 +638,7 @@ def estimate_travel_minutes(distance_km: float, mode: str = "drive") -> int:
 # 🧳 7. 旅行模式：多輪對話式行程規劃
 # ------------------------------------------
 # 流程：旅行模式 → 問出發時間 → 問回程時間 → 建立草案
-#      → 逐則輸入地點（地名或Google地圖連結，無須附時間）→ 輸入「結束」
+#      → 逐則輸入地點名稱（無須附時間）→ 米粒依地名判斷地址 → 輸入「結束」
 #      → AI 一次判斷拜訪順序並分配時間（無閒聊，直接給結果）
 #      → 使用者「確定」寫入資料庫，或直接描述修改內容（套用在草稿，尚未寫入DB）
 #      → 確定後以出發日期作為旅行單號，之後可用「旅行修改 單號」重新進入編輯
@@ -656,52 +692,39 @@ def ai_extract_datetime_only(text: str):
         log_error("AI日期時間辨識", e)
     return None
 
-def is_maps_url(text: str) -> bool:
-    return bool(re.search(r'(maps\.google|goo\.gl/maps|maps\.app\.goo\.gl|google\.com/maps)', text, re.IGNORECASE))
+class PlaceAddressExtraction(BaseModel):
+    place_name: str = Field(default="")
+    address: str = Field(default="")
+    recognized: bool = Field(default=False)
 
-def try_extract_latlon_from_url(text: str):
-    """Google地圖連結常見的座標格式：.../@25.033,121.565,17z 或 ?q=25.033,121.565"""
-    m = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', text)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-    m = re.search(r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)', text)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-    return None, None
-
-def resolve_maps_url(text: str) -> str:
-    """把 Google 地圖短網址展開成完整網址。短網址（goo.gl/maps、maps.app.goo.gl）本身
-    不含任何店名或座標資訊，必須實際發送請求跟隨轉址才能拿到真正的目的地網址，
-    這是先前「AI 分辨不出來」的根本原因 —— 之前只是把短網址原文丟給 AI 猜，AI 當然猜不出來。"""
-    urls = re.findall(r'https?://\S+', text)
-    url = urls[0] if urls else text.strip()
+def ai_search_place_address(text: str):
+    """給一個地名／關鍵字，由米粒(AI)依既有知識判斷最可能對應的地點名稱與完整地址（台灣地址優先）。
+    不是即時上網搜尋，僅供輔助判讀，判斷不出來或不確定時交還原文字讓使用者自行輸入地址。"""
+    prompt = (
+        f"請根據這個地名或關鍵字，判斷最可能對應的地點名稱與完整地址（台灣地址優先）。"
+        f"若不確定或無法判斷，請將 recognized 設為 false，不要亂猜。\n地名：『{text}』"
+    )
     try:
-        res = httpx.get(url, follow_redirects=True, timeout=8.0, verify=certifi.where())
-        return str(res.url)
+        result = ai_client.models.generate_content(
+            model='gemini-2.5-flash', contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=PlaceAddressExtraction, temperature=0.2),
+        ).parsed
+        if result and result.recognized and result.address:
+            return (result.place_name.strip() or text), result.address.strip()
     except Exception as e:
-        log_error("地圖網址展開", e)
-        return url
-
-def extract_place_name_from_url(url: str):
-    """從展開後的完整網址取得店名，例如 .../maps/place/台北101/@25.03,121.56,17z/..."""
-    m = re.search(r'/maps/place/([^/@]+)', url)
-    if m:
-        return unquote(m.group(1)).replace('+', ' ')
-    return None
+        log_error("地點地址搜尋", e)
+    return None, None
 
 def resolve_location_input(text: str):
     """統一的地點輸入解析入口：回傳 (location_name, lat, lon)。
-    是 Google 地圖網址就展開短網址取得店名與座標；不是網址就直接當地名做地理編碼。"""
+    由米粒依地名判斷實際地址，再用地址做地理編碼；判斷不出來就直接拿原文字做地理編碼，
+    地址不準確的話可在最後總覽階段輸入「把第N項改成正確地址」修正。"""
     text = text.strip()
-    if is_maps_url(text) or text.startswith("http"):
-        resolved_url = resolve_maps_url(text)
-        lat, lon = try_extract_latlon_from_url(resolved_url)
-        name = extract_place_name_from_url(resolved_url)
-        if not name:
-            name = f"地點（{lat:.5f}, {lon:.5f}）" if lat is not None else text
-        if lat is None:
-            lat, lon = geocode_location(name)
-        return name, lat, lon
+    name, address = ai_search_place_address(text)
+    if address:
+        lat, lon = geocode_location(address)
+        display_name = f"{name}（{address}）" if name and name != address else address
+        return display_name, lat, lon
     lat, lon = geocode_location(text)
     return text, lat, lon
 
@@ -814,7 +837,7 @@ def send_trip_review_draft(arranged: list, reply_token: str):
     summary = build_draft_summary_text(arranged)
     send_line_reply(
         reply_token,
-        f"🗺️ 【AI安排結果】\n{summary}\n\n"
+        f"🗺️ 【米粒安排結果】\n{summary}\n\n"
         f"回覆「確定」完成規劃並寫入資料庫，或直接輸入想修改的內容（例如：把第2項改成15:00、刪除第3項、新增 台北101）。"
     )
 
@@ -914,7 +937,7 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
         send_line_reply(
             reply_token,
             "🧳 開始規劃新旅行！請問這趟旅行的出發時間？\n"
-            "（格式：2026-07-19 19:00 或 2026/7/19 1900，也可以直接描述，我會請AI協助判讀）\n"
+            "（格式：2026-07-19 19:00 或 2026/7/19 1900，也可以直接描述，米粒會協助判讀）\n"
             "隨時可輸入「取消旅行」中止規劃。"
         )
         return True
@@ -967,8 +990,8 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
         send_line_reply(
             reply_token,
             f"✅ 已建立旅行草案！\n📅 {departure_at.strftime('%Y-%m-%d %H:%M')} → {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"請依序輸入想去的地點（貼 Google 地圖連結，或直接輸入地名/地址皆可，不用附時間）。\n"
-            f"全部輸入完畢後，請輸入「結束」，我會直接安排拜訪順序與時間。"
+            f"請依序輸入想去的地點名稱（不用附時間），米粒會協助搜尋地址；地址如果不準確，最後總覽時可以直接說要修正。\n"
+            f"全部輸入完畢後，請輸入「結束」，米粒會直接安排拜訪順序與時間。"
         )
         return True
 
@@ -979,7 +1002,7 @@ def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_
 
         if clean_text in ("結束", "完成", "結束規劃"):
             if not draft.get("locations"):
-                send_line_reply(reply_token, "⚠️ 目前還沒有任何地點，請先輸入至少一個地點（Google 地圖連結或地名皆可）。")
+                send_line_reply(reply_token, "⚠️ 目前還沒有任何地點，請先輸入至少一個地點名稱。")
                 return True
             try:
                 with db_cursor() as cur:
@@ -1479,11 +1502,11 @@ def handle_receipt_image(owner_type: str, owner_id: str, is_group: bool, creator
         extraction = extract_receipt(image_bytes)
     except Exception as e:
         log_error("收據辨識(AI串接)", e, owner_id)
-        send_line_reply(reply_token, f"⚠️ 收據辨識失敗：AI 辨識服務串接發生問題，請稍後再試一次。\n（若持續發生，麻煩回報管理員：{str(e)[:80]}）")
+        send_line_reply(reply_token, f"⚠️ 收據辨識失敗：辨識服務暫時連不上，請稍後再試一次。\n（若持續發生，麻煩回報管理員：{str(e)[:80]}）")
         return
 
     if extraction is None:
-        send_line_reply(reply_token, "⚠️ 收據辨識失敗：AI 沒有回傳可用的結果，請稍後再試一次。")
+        send_line_reply(reply_token, "⚠️ 收據辨識失敗：沒有取得可用的辨識結果，請稍後再試一次。")
         return
 
     items = [{"item_name": i.item_name or "未命名品項", "price": i.price} for i in extraction.items if i.price > 0]
@@ -1510,29 +1533,88 @@ def handle_receipt_image(owner_type: str, owner_id: str, is_group: bool, creator
             send_line_reply(reply_token, "⚠️ 辨識成功但寫入失敗，請稍後再試一次。")
         return
 
-    # 群組情境：暫存後詢問分攤方式
+    # 群組情境：暫存後詢問團單名稱
     try:
         with db_cursor() as cur:
             cur.execute(
-                """INSERT INTO pending_group_expense (group_id, payer_id, payer_name, items_json, total_amount, source)
-                   VALUES (%s, %s, %s, %s, %s, 'receipt')
+                """INSERT INTO pending_receipt_naming (group_id, payer_id, payer_name, items_json, total_amount)
+                   VALUES (%s, %s, %s, %s, %s)
                    ON DUPLICATE KEY UPDATE
                        payer_id=VALUES(payer_id), payer_name=VALUES(payer_name),
-                       items_json=VALUES(items_json), total_amount=VALUES(total_amount),
-                       source='receipt', created_at=NOW()""",
+                       items_json=VALUES(items_json), total_amount=VALUES(total_amount), created_at=NOW()""",
                 (owner_id, creator_id, creator_name, json.dumps(items, ensure_ascii=False), total)
             )
     except Exception as e:
-        log_error("收據待分攤建立", e, owner_id)
+        log_error("收據待命名建立", e, owner_id)
         send_line_reply(reply_token, "⚠️ 辨識成功但登記失敗，請稍後再試一次。")
         return
 
     send_line_reply(
         reply_token,
         f"🧾 收據辨識完成：\n{item_lines}\n💰 合計：${total}\n\n"
-        f"這筆怎麼記？\n1️⃣ 回覆「均分」→ 平分給已知群組成員\n2️⃣ tag 出實際分攤的人\n3️⃣ tag 並加金額（例如 @小明 100 @小華 50）→ 指定金額\n4️⃣ 回覆「跳過」→ 記一般花費\n\n"
-        f"若品項或金額有誤，登記完成後可輸入「修改 單號 項次 品項 金額」修正，例如：修改 1234 2 拿鐵 65"
+        f"請幫這筆團單取個名稱（例如：7/19 全家團購），輸入名稱後即完成登記。"
     )
+
+RECEIPT_NAMING_TIMEOUT_MIN = 10
+
+def try_handle_receipt_naming_reply(group_id: str, clean_text: str, reply_token: str) -> bool:
+    """處理收據辨識完成後，等待使用者輸入團單名稱的回覆"""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT payer_id, payer_name, items_json, total_amount, created_at FROM pending_receipt_naming WHERE group_id=%s",
+                (group_id,)
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        log_error("收據待命名查詢", e, group_id)
+        return False
+
+    if not row:
+        return False
+    if datetime.now() - row["created_at"] > timedelta(minutes=RECEIPT_NAMING_TIMEOUT_MIN):
+        try:
+            with db_cursor() as cur:
+                cur.execute("DELETE FROM pending_receipt_naming WHERE group_id=%s", (group_id,))
+        except Exception:
+            pass
+        return False  # 過期視為沒有待處理，讓訊息照正常流程走
+
+    order_name = clean_text.strip()
+    if not order_name:
+        return False
+
+    items = json.loads(row["items_json"])
+    payer_id, payer_name = row["payer_id"], row["payer_name"]
+    total = row["total_amount"]
+
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM pending_receipt_naming WHERE group_id=%s", (group_id,))
+            code_str = str(random.randint(1000, 9999))
+            cur.execute(
+                """INSERT INTO orders (group_id, order_code, order_name, order_date, total_amount, master_payer_id, master_payer_name)
+                   VALUES (%s, %s, %s, CURDATE(), %s, %s, %s)""",
+                (group_id, code_str, order_name, total, payer_id, payer_name)
+            )
+            order_pk = cur.lastrowid
+            for i in items:
+                cur.execute(
+                    """INSERT INTO order_items (group_id, order_code, order_id, buyer_id, buyer_name, item_name, price)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (group_id, code_str, order_pk, payer_id, payer_name, i["item_name"], i["price"])
+                )
+    except Exception as e:
+        log_error("收據團單寫入", e, group_id)
+        send_line_reply(reply_token, "⚠️ 登記失敗，請稍後再試一次。")
+        return True
+
+    send_line_reply(
+        reply_token,
+        f"✅ 登記完成！團單「{order_name}」單號：#{code_str}，共 ${total}\n如需修改請至後台修正。"
+    )
+    return True
+
 
 # ==========================================
 # 🌐 4. Webhook 核心主線
@@ -1598,7 +1680,7 @@ def handle_text_message(event):
     # ====================================================
     # 🧪 【測試限定功能：密碼驗證 / 待回覆狀態攔截層】
     # ------------------------------------------------------
-    # 優先序：密碼驗證 > 旅行模式多輪對話 > 行程「有/無」回覆 > 群組分攤「均分/@tag/跳過」回覆
+    # 優先序：密碼驗證 > 旅行模式多輪對話 > 行程「有/無」回覆 > 收據團單命名回覆 > 群組分攤「均分/@tag/跳過」回覆
     # 這幾層都是「上一則機器人訊息在等待使用者回覆」的情境，
     # 必須搶在核銷、開團等既有邏輯之前處理，否則會被其他規則誤判掉。
     # ====================================================
@@ -1611,6 +1693,9 @@ def handle_text_message(event):
         return
 
     if try_handle_itinerary_confirm_reply(owner_type, target_id, _gate_text, is_group, target_id, reply_token):
+        return
+
+    if is_group and try_handle_receipt_naming_reply(target_id, _gate_text, reply_token):
         return
 
     if is_group and try_handle_group_split_reply(target_id, event, _gate_text, creator_id, reply_token):
@@ -2150,7 +2235,7 @@ def api_list_orders(group_id: str):
     try:
         with db_cursor() as cur:
             cur.execute(
-                """SELECT id, order_code, order_date, total_amount, master_payer_name, created_at
+                """SELECT id, order_code, order_name, order_date, total_amount, master_payer_name, created_at
                    FROM orders WHERE group_id=%s ORDER BY created_at DESC""",
                 (group_id,)
             )
