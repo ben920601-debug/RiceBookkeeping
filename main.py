@@ -1,11 +1,13 @@
 import os
 import re
 import json
+import math
 import random
 import time
+import asyncio
 import httpx
 import certifi
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import Response
@@ -21,9 +23,10 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
 
 # Google GenAI & MySQL
 from google import genai
@@ -60,6 +63,10 @@ app.add_middleware(
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# 🧪 測試限定功能（行程模式／群組團單／收據辨識）共用的驗證密碼與開通時數
+TEST_MODE_PASSWORD = os.getenv("TEST_MODE_PASSWORD", "")
+TEST_MODE_HOURS = int(os.getenv("TEST_MODE_HOURS", "16"))
 
 MY_LIFF_ID = "2010446205-W1G1WDQQ" 
 
@@ -145,23 +152,6 @@ DEFAULT_KEYWORD_REPLIES = {
         "他創造我之外呢，也創造了飯匙在不同地方服務大眾😄\n"
         "如有興趣，歡迎到下方點選前往IG或是找@denguword1220\n"
         "非常期待與您有更多的互動😆"
-    ),
-    "思妤是誰？": (
-        "思妤是一個瘋女人！\n"
-        "電鍋都會叫他狗東西\n"
-        "因為他真的太狗了，快受不了\n"
-        "好啦，還是很喜歡他的，嘻嘻😁"
-    ),
-    "欣俞是誰？": (
-        "欣俞是一個非常稱職的店長媽媽！\n"
-        "因為他三不五時要照顧我們這些小朋友\n"
-        "儘管他很累，但總是先為我們著想\n"
-        "謝謝媽媽👩"
-    ),
-    "哲宇是誰？": (
-        "哲宇是一個非常稱職的店長！\n"
-        "沒有他管不好的店，只有聽不懂人話員工\n"
-        "尤其是他吼人的時候好帥喔😆"
     )
 }
 
@@ -387,6 +377,654 @@ def resolve_id_to_name(target_id: str, user_id: str) -> str:
         print(f"⚠️ resolve_id_to_name 查詢異常: {e}", flush=True)
     return f"成員({user_id[:4]})"
 
+def push_line_message(target_id: str, text: str):
+    """主動推播（非回覆使用者訊息，用於行程提醒等背景排程主動發起的通知）"""
+    try:
+        with ApiClient(line_config) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=target_id, messages=[TextMessage(text=text)])
+            )
+        log_stat_event("push", target_id)
+    except Exception as e:
+        log_error("LINE主動推播", e, target_id)
+
+# ==========================================
+# 🧪 5. 測試限定功能：密碼驗證機制
+# ------------------------------------------
+# 「行程模式」「群組團單」「收據辨識」三個功能目前僅供測試，
+# 觸發對應關鍵字後，機器人會要求輸入密碼，密碼比對成功後
+# 針對該 owner（個人或群組）開啟 TEST_MODE_HOURS 小時的功能授權，
+# 效期一到，下次判斷時就會自動視為未開通，不需要額外排程清除。
+# ==========================================
+TEST_FEATURE_KEYWORDS = {
+    "行程模式": "itinerary",
+    "群組團單": "group_split",
+    "收據辨識": "receipt_ocr",
+}
+TEST_FEATURE_LABELS = {v: k for k, v in TEST_FEATURE_KEYWORDS.items()}
+PENDING_PASSWORD_TIMEOUT_MIN = 5  # 密碼請求超過此時間未輸入就視為過期，避免使用者很久後亂打字誤觸
+
+def is_test_mode_active(owner_type: str, owner_id: str, feature: str) -> bool:
+    if not DB_READY or not TEST_MODE_PASSWORD:
+        return False
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT expires_at FROM test_mode_sessions WHERE owner_type=%s AND owner_id=%s AND feature=%s",
+                (owner_type, owner_id, feature)
+            )
+            row = cur.fetchone()
+            return bool(row and row["expires_at"] > datetime.now())
+    except Exception as e:
+        log_error("測試模式檢查", e, owner_id)
+        return False
+
+def set_pending_password(owner_type: str, owner_id: str, feature: str):
+    with db_cursor() as cur:
+        cur.execute(
+            """INSERT INTO test_mode_pending (owner_type, owner_id, feature, requested_at)
+               VALUES (%s, %s, %s, NOW())
+               ON DUPLICATE KEY UPDATE feature=VALUES(feature), requested_at=NOW()""",
+            (owner_type, owner_id, feature)
+        )
+
+def get_pending_feature(owner_type: str, owner_id: str):
+    """取得等待驗證中的功能；若已超過逾時時間則視為過期並自動清除"""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT feature, requested_at FROM test_mode_pending WHERE owner_type=%s AND owner_id=%s",
+            (owner_type, owner_id)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        if datetime.now() - row["requested_at"] > timedelta(minutes=PENDING_PASSWORD_TIMEOUT_MIN):
+            cur.execute("DELETE FROM test_mode_pending WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
+            return None
+        return row["feature"]
+
+def clear_pending_password(owner_type: str, owner_id: str):
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM test_mode_pending WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
+
+def activate_test_mode(owner_type: str, owner_id: str, feature: str):
+    expires = datetime.now() + timedelta(hours=TEST_MODE_HOURS)
+    with db_cursor() as cur:
+        cur.execute(
+            """INSERT INTO test_mode_sessions (owner_type, owner_id, feature, expires_at)
+               VALUES (%s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE expires_at=VALUES(expires_at)""",
+            (owner_type, owner_id, feature, expires)
+        )
+    return expires
+
+def try_handle_test_mode_gate(owner_type: str, owner_id: str, clean_text: str, reply_token: str) -> bool:
+    """
+    統一處理測試功能的密碼流程，回傳 True 代表這則訊息已經被這一層攔截處理完畢，
+    外層 handle_text_message 應該直接 return，不要再往下跑其他邏輯。
+    """
+    if not DB_READY:
+        return False
+
+    # 1) 若正在等待密碼輸入，這一則訊息就當作密碼本身來比對
+    try:
+        pending_feature = get_pending_feature(owner_type, owner_id)
+    except Exception as e:
+        log_error("待驗證密碼查詢", e, owner_id)
+        pending_feature = None
+
+    if pending_feature:
+        if not TEST_MODE_PASSWORD:
+            clear_pending_password(owner_type, owner_id)
+            send_line_reply(reply_token, "⚠️ 尚未設定測試密碼，請聯絡管理員設定 TEST_MODE_PASSWORD 後再試。")
+            return True
+        if clean_text.strip() == TEST_MODE_PASSWORD:
+            clear_pending_password(owner_type, owner_id)
+            expires = activate_test_mode(owner_type, owner_id, pending_feature)
+            label = TEST_FEATURE_LABELS.get(pending_feature, pending_feature)
+            send_line_reply(
+                reply_token,
+                f"✅「{label}」測試模式已啟用！\n⏳ 效期至：{expires.strftime('%m/%d %H:%M')}（{TEST_MODE_HOURS} 小時後自動關閉）"
+            )
+        else:
+            clear_pending_password(owner_type, owner_id)
+            send_line_reply(reply_token, "❌ 密碼錯誤，測試模式未開啟。若要重試請重新輸入功能關鍵字。")
+        return True
+
+    # 2) 沒有等待中的密碼請求時，檢查這則訊息是不是「觸發詞」
+    matched_feature = None
+    for kw, feature in TEST_FEATURE_KEYWORDS.items():
+        if kw in clean_text:
+            matched_feature = feature
+            break
+    if not matched_feature:
+        return False
+
+    if is_test_mode_active(owner_type, owner_id, matched_feature):
+        label = TEST_FEATURE_LABELS[matched_feature]
+        send_line_reply(reply_token, f"ℹ️「{label}」測試模式目前已經是啟用中的狀態囉！")
+        return True
+
+    if not TEST_MODE_PASSWORD:
+        send_line_reply(reply_token, "⚠️ 尚未設定測試密碼，請聯絡管理員設定 TEST_MODE_PASSWORD 後再試。")
+        return True
+
+    try:
+        set_pending_password(owner_type, owner_id, matched_feature)
+    except Exception as e:
+        log_error("設定待驗證密碼", e, owner_id)
+        return True
+
+    label = TEST_FEATURE_LABELS[matched_feature]
+    send_line_reply(reply_token, f"🔐「{label}」為測試限定功能，請直接輸入測試密碼以開通（{PENDING_PASSWORD_TIMEOUT_MIN} 分鐘內有效）：")
+    return True
+
+# ==========================================
+# 🗺️ 6. 行程模式：地理編碼與通勤估算
+# ------------------------------------------
+# 測試階段先用免費、免申請金鑰的 OpenStreetMap Nominatim 做地理編碼，
+# 搭配 Haversine 公式算「直線距離」概略估算通勤時間 —— 不考慮實際路網、
+# 路況、單行道等因素，僅供測試流程驗證使用。未來要提升精準度，
+# 可以換成 Google Maps Distance Matrix API（需要金鑰與計費帳號）。
+# ==========================================
+def geocode_location(location_name: str):
+    """回傳 (lat, lon)；查不到則回傳 (None, None)"""
+    try:
+        headers = {"User-Agent": "RiceBookkeepingBot/1.0 (test-mode itinerary feature)"}
+        res = httpx.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": location_name, "format": "json", "limit": 1, "countrycodes": "tw"},
+            headers=headers, timeout=6.0, verify=certifi.where()
+        )
+        data = res.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception as e:
+        log_error("地理編碼", e)
+    return None, None
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+def estimate_travel_minutes(distance_km: float, mode: str = "drive") -> int:
+    """概略估算：市區均速抓開車 30km/h、步行 5km/h，僅供測試參考"""
+    speed = 30 if mode == "drive" else 5
+    return max(1, round((distance_km / speed) * 60))
+
+# ==========================================
+# 🗓️ 7. 行程模式：新增／查詢／提醒推播
+# ==========================================
+ITINERARY_ADD_PATTERN = re.compile(
+    r'^(?:新增行程|行程)?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$'
+)
+
+def try_add_itinerary(owner_type: str, owner_id: str, creator_id: str, clean_text: str, reply_token: str) -> bool:
+    """輸入格式：2026/07/20 14:30 台北市政府（前面可加「新增行程」或「行程」字樣皆可辨識）"""
+    m = ITINERARY_ADD_PATTERN.match(clean_text)
+    if not m:
+        return False
+
+    date_str, time_str, location_name = m.groups()
+    date_str = date_str.replace("/", "-")
+    location_name = location_name.strip()
+    try:
+        scheduled_at = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        send_line_reply(reply_token, "⚠️ 日期時間格式看不懂，請用「YYYY-MM-DD HH:MM 地點」的格式輸入，例如：\n2026-07-20 14:30 台北市政府")
+        return True
+
+    if scheduled_at <= datetime.now():
+        send_line_reply(reply_token, "⚠️ 這個時間已經過去了，請輸入未來的行程時間。")
+        return True
+
+    lat, lon = geocode_location(location_name)
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO itineraries
+                   (owner_type, owner_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (owner_type, owner_id, scheduled_at, location_name, lat, lon, creator_id)
+            )
+    except Exception as e:
+        log_error("行程新增", e, owner_id)
+        send_line_reply(reply_token, "⚠️ 行程登記失敗，請稍後再試一次。")
+        return True
+
+    geo_note = "" if lat is not None else "\n⚠️ 這個地點沒有查到座標，屆時提醒訊息將不會包含通勤估算。"
+    send_line_reply(
+        reply_token,
+        f"🗓️ 已登記行程：\n📍 {location_name}\n🕒 {scheduled_at.strftime('%Y-%m-%d %H:%M')}\n👉 出發前 15 分鐘會主動提醒您！{geo_note}"
+    )
+    return True
+
+def try_list_itineraries(owner_type: str, owner_id: str, clean_text: str, reply_token: str) -> bool:
+    if "查看行程" not in clean_text and "行程清單" not in clean_text:
+        return False
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT scheduled_at, location_name FROM itineraries
+                   WHERE owner_type=%s AND owner_id=%s AND scheduled_at > NOW()
+                   ORDER BY scheduled_at ASC LIMIT 10""",
+                (owner_type, owner_id)
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        log_error("行程查詢", e, owner_id)
+        send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
+        return True
+
+    if not rows:
+        send_line_reply(reply_token, "📭 目前沒有登記中的未來行程。\n👉 輸入「2026-07-20 14:30 台北市政府」即可新增。")
+    else:
+        lines = ["🗓️ 【未來行程清單】"]
+        for r in rows:
+            lines.append(f"・{r['scheduled_at'].strftime('%m/%d %H:%M')}　{r['location_name']}")
+        send_line_reply(reply_token, "\n".join(lines))
+    return True
+
+def send_itinerary_reminder(it: dict):
+    owner_type = it["owner_type"]
+    owner_id = it["owner_id"]
+    lines = [f"⏰ 【行程提醒】{it['scheduled_at'].strftime('%H:%M')} 即將前往：{it['location_name']}"]
+
+    if it["latitude"] is not None and it["longitude"] is not None:
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    """SELECT location_name, latitude, longitude, scheduled_at FROM itineraries
+                       WHERE owner_type=%s AND owner_id=%s AND scheduled_at > %s
+                       ORDER BY scheduled_at ASC LIMIT 1""",
+                    (owner_type, owner_id, it["scheduled_at"])
+                )
+                nxt = cur.fetchone()
+            if nxt and nxt["latitude"] is not None:
+                dist = haversine_km(float(it["latitude"]), float(it["longitude"]), float(nxt["latitude"]), float(nxt["longitude"]))
+                mins = estimate_travel_minutes(dist)
+                lines.append(
+                    f"🚗 下一站「{nxt['location_name']}」（{nxt['scheduled_at'].strftime('%H:%M')}）\n"
+                    f"　　約 {dist:.1f} 公里，車程估計 {mins} 分鐘\n"
+                    f"　　（直線距離估算，僅供測試參考，非實際路網路徑）"
+                )
+        except Exception as e:
+            log_error("通勤估算", e, owner_id)
+
+    lines.append("\n💰 這趟行程有花費要記錄嗎？回覆「有」開始登記，或回覆「無」略過。")
+    push_line_message(owner_id, "\n".join(lines))
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO pending_itinerary_confirm (owner_type, owner_id, itinerary_id, created_at)
+                   VALUES (%s, %s, %s, NOW())
+                   ON DUPLICATE KEY UPDATE itinerary_id=VALUES(itinerary_id), created_at=NOW()""",
+                (owner_type, owner_id, it["id"])
+            )
+    except Exception as e:
+        log_error("行程待確認寫入", e, owner_id)
+
+def check_and_send_itinerary_reminders():
+    """由背景排程每分鐘呼叫一次：找出 14~16 分鐘後即將開始、還沒提醒過的行程"""
+    if not DB_READY:
+        return
+    now = datetime.now()
+    window_start = now + timedelta(minutes=14)
+    window_end = now + timedelta(minutes=16)
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT * FROM itineraries
+                   WHERE notified=0 AND scheduled_at BETWEEN %s AND %s""",
+                (window_start, window_end)
+            )
+            due_items = cur.fetchall()
+            for it in due_items:
+                cur.execute("UPDATE itineraries SET notified=1 WHERE id=%s", (it["id"],))
+    except Exception as e:
+        log_error("行程排程查詢", e)
+        return
+
+    for it in due_items:
+        send_itinerary_reminder(it)
+
+def try_handle_itinerary_confirm_reply(owner_type: str, owner_id: str, clean_text: str, is_group: bool, target_id: str, reply_token: str) -> bool:
+    """處理行程提醒推播後，使用者回覆「有／無」是否要記錄花費"""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT itinerary_id FROM pending_itinerary_confirm WHERE owner_type=%s AND owner_id=%s",
+                (owner_type, owner_id)
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        log_error("行程待確認查詢", e, owner_id)
+        return False
+
+    if not row:
+        return False
+
+    positive = any(k in clean_text for k in ["有", "要", "記錄", "登記"])
+    negative = any(k in clean_text for k in ["無", "沒有", "不用", "略過", "skip"])
+    if not (positive or negative):
+        return False  # 不是在回答這個問題，讓訊息繼續往下走正常流程
+
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM pending_itinerary_confirm WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
+    except Exception as e:
+        log_error("行程待確認清除", e, owner_id)
+
+    if negative:
+        send_line_reply(reply_token, "👌 好的，這趟行程不記錄花費。")
+        return True
+
+    if is_group:
+        code_str = str(random.randint(1000, 9999))
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "UPDATE `groups` SET state='order', active_order_code=%s WHERE group_id=%s",
+                    (code_str, target_id)
+                )
+                cur.execute(
+                    "UPDATE itineraries SET related_order_code=%s WHERE id=%s",
+                    (code_str, row["itinerary_id"])
+                )
+            send_line_reply(reply_token, f"🚀 已開啟本次行程消費登記！單號：#{code_str}\n👉 請大家直接輸入「品項 金額」登記花費，行程結束後輸入「結單」結算。")
+        except Exception as e:
+            log_error("行程開團寫入", e, target_id)
+    else:
+        send_line_reply(reply_token, "👌 好的，請直接輸入「項目 金額」，我會記錄到您的個人帳本。")
+    return True
+
+async def itinerary_reminder_loop():
+    """背景排程：每 60 秒檢查一次是否有即將開始的行程需要提醒"""
+    while True:
+        try:
+            await asyncio.to_thread(check_and_send_itinerary_reminders)
+        except Exception as e:
+            log_error("行程排程迴圈", e)
+        await asyncio.sleep(60)
+
+# ==========================================
+# 🍱 8. 群組團單：均分／@tag／跳過 分攤流程
+# ==========================================
+def get_group_member_list(group_id: str) -> list:
+    """取得目前快取到的群組成員清單（可能不完整，僅限機器人曾經互動過的成員）"""
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT user_id, display_name FROM group_members WHERE group_id=%s", (group_id,))
+            return cur.fetchall()
+    except Exception as e:
+        log_error("群組成員查詢", e, group_id)
+        return []
+
+def create_split_order(group_id: str, payer_id: str, payer_name: str, items: list, participants: list) -> str:
+    """
+    items: [{"item_name": str, "price": int}, ...]（該筆花費的品項明細，用於算總額與訂單品項名稱）
+    participants: [{"user_id": str, "display_name": str}, ...]（要平均分攤的人）
+    回傳新產生的 4 碼團單號
+    """
+    total = sum(i["price"] for i in items)
+    n = max(1, len(participants))
+    base_share = total // n
+    remainder = total - base_share * n
+
+    code_str = str(random.randint(1000, 9999))
+    with db_cursor() as cur:
+        cur.execute(
+            """INSERT INTO orders (group_id, order_code, order_date, total_amount, master_payer_id, master_payer_name)
+               VALUES (%s, %s, CURDATE(), %s, %s, %s)""",
+            (group_id, code_str, total, payer_id, payer_name)
+        )
+        order_pk = cur.lastrowid
+        item_label = "、".join(i["item_name"] for i in items) if len(items) <= 3 else f"{items[0]['item_name']}等{len(items)}項"
+        for idx, p in enumerate(participants):
+            share = base_share + (remainder if idx == 0 else 0)  # 餘數歸給第一位（通常是付款人自己）
+            cur.execute(
+                """INSERT INTO order_items (group_id, order_code, order_id, buyer_id, buyer_name, item_name, price)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (group_id, code_str, order_pk, p["user_id"], p["display_name"], item_label, share)
+            )
+    return code_str
+
+def try_handle_group_split_reply(group_id: str, event, clean_text: str, creator_id: str, reply_token: str) -> bool:
+    """處理群組團單詢問後，使用者回覆「均分／@tag／跳過」"""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT payer_id, payer_name, items_json, total_amount, created_at FROM pending_group_expense WHERE group_id=%s",
+                (group_id,)
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        log_error("待分攤花費查詢", e, group_id)
+        return False
+
+    if not row:
+        return False
+    if datetime.now() - row["created_at"] > timedelta(minutes=10):
+        try:
+            with db_cursor() as cur:
+                cur.execute("DELETE FROM pending_group_expense WHERE group_id=%s", (group_id,))
+        except Exception:
+            pass
+        return False  # 過期視為沒有待處理，讓訊息照正常流程走
+
+    items = json.loads(row["items_json"])
+    payer_id, payer_name = row["payer_id"], row["payer_name"]
+    real_tagged_ids = get_real_mentions(event)
+    is_skip = any(k in clean_text for k in ["跳過", "不分攤", "算了", "略過"])
+    is_split_even = any(k in clean_text for k in ["均分", "平分", "平攤"])
+
+    if not (is_skip or is_split_even or real_tagged_ids):
+        return False  # 不是在回答這個問題
+
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM pending_group_expense WHERE group_id=%s", (group_id,))
+    except Exception as e:
+        log_error("待分攤花費清除", e, group_id)
+
+    if is_skip:
+        try:
+            with db_cursor() as cur:
+                for i in items:
+                    cur.execute(
+                        """INSERT INTO expenses
+                           (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
+                           VALUES ('group', %s, 'expense', %s, %s, '生活雜費', %s, %s)""",
+                        (group_id, i["price"], i["item_name"], payer_id, payer_name)
+                    )
+            send_line_reply(reply_token, f"✅ 已記為一般花費（不分攤）：共 ${row['total_amount']}")
+        except Exception as e:
+            log_error("跳過分攤寫入", e, group_id)
+            send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
+        return True
+
+    if real_tagged_ids:
+        participants = [{"user_id": uid, "display_name": resolve_id_to_name(group_id, uid)} for uid in real_tagged_ids]
+    else:
+        members = get_group_member_list(group_id)
+        participants = members if members else [{"user_id": payer_id, "display_name": payer_name}]
+
+    try:
+        code_str = create_split_order(group_id, payer_id, payer_name, items, participants)
+    except Exception as e:
+        log_error("分攤建單", e, group_id)
+        send_line_reply(reply_token, "⚠️ 分攤登記失敗，請稍後再試一次。")
+        return True
+
+    names = "、".join(p["display_name"] for p in participants)
+    send_line_reply(
+        reply_token,
+        f"✅ 已登記分攤！團單號：#{code_str}\n💰 總額：${row['total_amount']}\n👥 分攤成員：{names}\n👉 之後可輸入「核銷 #{code_str}」開始對帳。"
+    )
+    return True
+
+def try_start_group_split_question(group_id: str, item_name: str, amount: int, payer_id: str, payer_name: str, reply_token: str) -> bool:
+    """一般模式下輸入「品項 金額」時，若群組團單測試模式已啟用，改為詢問分攤方式而非直接記帳"""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO pending_group_expense (group_id, payer_id, payer_name, items_json, total_amount, source)
+                   VALUES (%s, %s, %s, %s, %s, 'text')
+                   ON DUPLICATE KEY UPDATE
+                       payer_id=VALUES(payer_id), payer_name=VALUES(payer_name),
+                       items_json=VALUES(items_json), total_amount=VALUES(total_amount),
+                       source='text', created_at=NOW()""",
+                (group_id, payer_id, payer_name, json.dumps([{"item_name": item_name, "price": amount}], ensure_ascii=False), amount)
+            )
+    except Exception as e:
+        log_error("待分攤花費建立", e, group_id)
+        return False
+
+    send_line_reply(
+        reply_token,
+        f"💰 {item_name} ${amount}，這筆怎麼記？\n"
+        f"1️⃣ 回覆「均分」→ 平分給已知的群組成員\n"
+        f"2️⃣ tag 出實際分攤的人（例如 @小明 @小華）→ 平分給這些人\n"
+        f"3️⃣ 回覆「跳過」→ 記一般花費，不分攤"
+    )
+    return True
+
+# ==========================================
+# 🧾 9. 收據辨識：Gemini 圖片辨識與品項修改
+# ==========================================
+class ReceiptItemModel(BaseModel):
+    item_name: str = Field(default="")
+    price: int = Field(default=0)
+
+class ReceiptExtraction(BaseModel):
+    items: List[ReceiptItemModel] = Field(default_factory=list)
+    total_amount: int = Field(default=0)
+
+def download_line_image(message_id: str) -> bytes:
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    res = httpx.get(url, headers=headers, timeout=15.0, verify=certifi.where())
+    res.raise_for_status()
+    return res.content
+
+def extract_receipt(image_bytes: bytes) -> ReceiptExtraction:
+    prompt = "請辨識這張收據或發票圖片，列出每個品項名稱與金額（整數），並提供收據總金額。若品項名稱無法辨識，可用「品項1」「品項2」等命名代替，但金額務必盡量準確判讀。"
+    result = ai_client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            prompt
+        ],
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=ReceiptExtraction, temperature=0.1),
+    )
+    return result.parsed
+
+EDIT_ORDER_ITEM_PATTERN = re.compile(r'^修改\s+(\d{4})\s+(\d+)\s+(.+?)\s+(\d+)$')
+
+def try_handle_edit_order_item(group_id: str, clean_text: str, reply_token: str) -> bool:
+    """輸入「修改 1234 2 拿鐵 65」：修改單號1234的第2個品項為 拿鐵 $65（適用收據辨識或一般團單品項修正）"""
+    m = EDIT_ORDER_ITEM_PATTERN.match(clean_text)
+    if not m:
+        return False
+    order_code, index_str, new_item_name, new_price_str = m.groups()
+    index = int(index_str)
+    new_price = int(new_price_str)
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id FROM order_items WHERE group_id=%s AND order_code=%s ORDER BY id ASC",
+                (group_id, order_code)
+            )
+            rows = cur.fetchall()
+            if not rows or index < 1 or index > len(rows):
+                send_line_reply(reply_token, f"❌ 找不到單號 #{order_code} 的第 {index} 項，請確認團單號碼與項次是否正確。")
+                return True
+            target_item_id = rows[index - 1]["id"]
+            cur.execute(
+                "UPDATE order_items SET item_name=%s, price=%s WHERE id=%s",
+                (new_item_name.strip(), new_price, target_item_id)
+            )
+            cur.execute(
+                """UPDATE orders SET total_amount=(
+                       SELECT COALESCE(SUM(price),0) FROM order_items WHERE order_code=%s AND group_id=%s
+                   ) WHERE order_code=%s AND group_id=%s""",
+                (order_code, group_id, order_code, group_id)
+            )
+        send_line_reply(reply_token, f"✅ 已修改單號 #{order_code} 第 {index} 項為：{new_item_name.strip()} ${new_price}")
+    except Exception as e:
+        log_error("團單品項修改", e, group_id)
+        send_line_reply(reply_token, "⚠️ 修改失敗，請稍後再試一次。")
+    return True
+
+def handle_receipt_image(owner_type: str, owner_id: str, is_group: bool, creator_id: str, creator_name: str, reply_token: str, message_id: str):
+    try:
+        image_bytes = download_line_image(message_id)
+    except Exception as e:
+        log_error("收據圖片下載", e, owner_id)
+        send_line_reply(reply_token, "⚠️ 圖片下載失敗，請重新傳送一次。")
+        return
+
+    try:
+        extraction = extract_receipt(image_bytes)
+    except Exception as e:
+        log_error("收據辨識", e, owner_id)
+        send_line_reply(reply_token, "⚠️ 收據辨識失敗，可能圖片不夠清晰，請重新拍攝後再試一次。")
+        return
+
+    items = [{"item_name": i.item_name or "未命名品項", "price": i.price} for i in extraction.items if i.price > 0]
+    if not items:
+        send_line_reply(reply_token, "⚠️ 沒有辨識到任何品項金額，請確認收據是否清晰完整。")
+        return
+
+    total = extraction.total_amount if extraction.total_amount > 0 else sum(i["price"] for i in items)
+    item_lines = "\n".join(f"・{i['item_name']}：${i['price']}" for i in items)
+
+    if not is_group:
+        try:
+            with db_cursor() as cur:
+                for i in items:
+                    cur.execute(
+                        """INSERT INTO expenses
+                           (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
+                           VALUES ('user', %s, 'expense', %s, %s, '生活雜費', %s, %s)""",
+                        (owner_id, i["price"], i["item_name"], creator_id, creator_name)
+                    )
+            send_line_reply(reply_token, f"🧾 收據辨識完成，已記入個人帳本：\n{item_lines}\n💰 合計：${total}")
+        except Exception as e:
+            log_error("收據個人記帳寫入", e, owner_id)
+            send_line_reply(reply_token, "⚠️ 辨識成功但寫入失敗，請稍後再試一次。")
+        return
+
+    # 群組情境：暫存後詢問分攤方式
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO pending_group_expense (group_id, payer_id, payer_name, items_json, total_amount, source)
+                   VALUES (%s, %s, %s, %s, %s, 'receipt')
+                   ON DUPLICATE KEY UPDATE
+                       payer_id=VALUES(payer_id), payer_name=VALUES(payer_name),
+                       items_json=VALUES(items_json), total_amount=VALUES(total_amount),
+                       source='receipt', created_at=NOW()""",
+                (owner_id, creator_id, creator_name, json.dumps(items, ensure_ascii=False), total)
+            )
+    except Exception as e:
+        log_error("收據待分攤建立", e, owner_id)
+        send_line_reply(reply_token, "⚠️ 辨識成功但登記失敗，請稍後再試一次。")
+        return
+
+    send_line_reply(
+        reply_token,
+        f"🧾 收據辨識完成：\n{item_lines}\n💰 合計：${total}\n\n"
+        f"這筆怎麼記？\n1️⃣ 回覆「均分」→ 平分給已知群組成員\n2️⃣ tag 出實際分攤的人\n3️⃣ 回覆「跳過」→ 記一般花費\n\n"
+        f"若品項或金額有誤，登記完成後可輸入「修改 單號 項次 品項 金額」修正，例如：修改 1234 2 拿鐵 65"
+    )
+
 # ==========================================
 # 🌐 4. Webhook 核心主線
 # ==========================================
@@ -417,6 +1055,7 @@ def handle_text_message(event):
     
     target_id = event.source.group_id if is_group else creator_id
     root_collection = "groups" if is_group else "users"  # 保留供語意參考，實際寫入以 owner_type 欄位區分
+    owner_type = "group" if is_group else "user"
 
     current_mode = "normal"
     active_code = ""
@@ -446,6 +1085,24 @@ def handle_text_message(event):
     if mention and mention.mentionees: is_bot_tagged = True
     if any(kw in user_text for kw in ["@記帳米粒", "記帳米粒"]): is_bot_tagged = True
     if is_group and not is_bot_tagged: return 
+
+    # ====================================================
+    # 🧪 【測試限定功能：密碼驗證 / 待回覆狀態攔截層】
+    # ------------------------------------------------------
+    # 優先序：密碼驗證 > 行程「有/無」回覆 > 群組分攤「均分/@tag/跳過」回覆
+    # 這幾層都是「上一則機器人訊息在等待使用者回覆」的情境，
+    # 必須搶在核銷、開團等既有邏輯之前處理，否則會被其他規則誤判掉。
+    # ====================================================
+    _gate_text = user_text.replace("@記帳米粒", "").replace("記帳米粒", "").strip()
+
+    if try_handle_test_mode_gate(owner_type, target_id, _gate_text, reply_token):
+        return
+
+    if try_handle_itinerary_confirm_reply(owner_type, target_id, _gate_text, is_group, target_id, reply_token):
+        return
+
+    if is_group and try_handle_group_split_reply(target_id, event, _gate_text, creator_id, reply_token):
+        return
 
     # ====================================================
     # 🎯 🛠️ 【核銷解鎖與防呆邏輯】
@@ -573,6 +1230,22 @@ def handle_text_message(event):
     clean_text = user_text.replace("@記帳米粒", "").replace("記帳米粒", "").strip()
 
     # ====================================================
+    # 🗓️ 【測試限定：行程模式 - 新增／查詢行程】
+    # ====================================================
+    if is_test_mode_active(owner_type, target_id, "itinerary"):
+        if try_add_itinerary(owner_type, target_id, creator_id, clean_text, reply_token):
+            return
+        if try_list_itineraries(owner_type, target_id, clean_text, reply_token):
+            return
+
+    # ====================================================
+    # 🧾 【測試限定：收據辨識 - 修改已登記的品項】
+    # ====================================================
+    if is_group and is_test_mode_active(owner_type, target_id, "receipt_ocr"):
+        if try_handle_edit_order_item(target_id, clean_text, reply_token):
+            return
+
+    # ====================================================
     # 🎯 ⚡ 【V1.1 Python 層攔截：新增特定詞觸發指定回覆】
     # ====================================================
     for kw, reply_msg in get_keyword_replies().items():
@@ -645,8 +1318,14 @@ def handle_text_message(event):
         if not item_name.isdigit() and amount > 0:
             if current_mode == "normal":
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
-                owner_type = "group" if is_group else "user"
                 record_type = "income" if is_income_quick else "expense"
+
+                # 🍱 測試限定：群組團單分攤 —— 群組、支出（非收入）、且該群組已開通測試模式時，
+                # 改為詢問「均分／@tag／跳過」，而不是直接寫入一般記帳
+                if is_group and not is_income_quick and is_test_mode_active("group", target_id, "group_split"):
+                    if try_start_group_split_question(target_id, item_name, amount, creator_id, creator_name_str, reply_token):
+                        return
+
                 try:
                     with db_cursor() as cur:
                         cur.execute(
@@ -805,9 +1484,35 @@ def handle_text_message(event):
     except Exception as e:
         log_error("Gemini解析", e, target_id)
 
+@line_handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    """🧾 測試限定：收據辨識入口。圖片訊息無法像文字一樣 @tag 機器人，
+    因此只要該使用者/群組已開通「收據辨識」測試模式，收到圖片就會直接處理，
+    不用另外要求 tag。"""
+    if not DB_READY or not is_bot_enabled():
+        return
+
+    is_group = event.source.type == "group"
+    creator_id = event.source.user_id
+    target_id = event.source.group_id if is_group else creator_id
+    owner_type = "group" if is_group else "user"
+    reply_token = event.reply_token
+    message_id = event.message.id
+
+    if not is_test_mode_active(owner_type, target_id, "receipt_ocr"):
+        return  # 未開通測試模式時，靜默忽略圖片，避免一般使用者誤傳照片收到困惑訊息
+
+    creator_name = resolve_id_to_name(target_id, creator_id)
+    handle_receipt_image(owner_type, target_id, is_group, creator_id, creator_name, reply_token, message_id)
+
+@app.on_event("startup")
+async def start_background_scheduler():
+    """🗓️ 行程模式提醒推播的背景排程，每 60 秒檢查一次是否有即將開始的行程"""
+    asyncio.create_task(itinerary_reminder_loop())
+
 @app.get("/")
 def health_check(): 
-    return {"status": "mysql_active", "version": "v1.2-MySQL"}
+    return {"status": "mysql_active", "version": "v1.4-MySQL-test-features"}
 
 # ==========================================
 # 🖥️ 5. 監控後台 REST API（供 index.html 呼叫，取代原本直連 Firestore 的寫法）
