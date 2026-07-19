@@ -160,9 +160,10 @@ DEFAULT_KEYWORD_REPLIES = {
 # 中控後台修改資料後，最多 CACHE_TTL 秒內會自動生效，不需要重啟服務
 # ------------------------------------------
 CACHE_TTL = 5  # 秒（原本15秒，縮短以減少「關閉機器人」等設定生效的延遲）
-_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": [], "maintenance_message": ""}
+_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": [], "maintenance_message": "", "ai_persona": ""}
 
 DEFAULT_MAINTENANCE_MESSAGE = "🤖 系統維護中，請稍後再試。"
+DEFAULT_AI_PERSONA = "你是一個親切、幽默的記帳助理「記帳米粒」。"
 
 def _seed_defaults_if_empty():
     """服務第一次啟動、資料表全空時，把原本寫死的內容灌進資料庫一次，之後就都用資料庫版本"""
@@ -184,6 +185,10 @@ def _seed_defaults_if_empty():
                 "INSERT IGNORE INTO bot_settings (`key`, `value`) VALUES ('maintenance_message', %s)",
                 (DEFAULT_MAINTENANCE_MESSAGE,)
             )
+            cur.execute(
+                "INSERT IGNORE INTO bot_settings (`key`, `value`) VALUES ('ai_persona', %s)",
+                (DEFAULT_AI_PERSONA,)
+            )
     except Exception as e:
         print(f"⚠️ 預設資料灌入失敗（若資料表尚未建立，請先執行 migration.sql）: {e}", flush=True)
 
@@ -192,10 +197,11 @@ def _refresh_cache_if_stale():
         return
     try:
         with db_cursor() as cur:
-            cur.execute("SELECT `key`, `value` FROM bot_settings WHERE `key` IN ('bot_enabled', 'maintenance_message')")
+            cur.execute("SELECT `key`, `value` FROM bot_settings WHERE `key` IN ('bot_enabled', 'maintenance_message', 'ai_persona')")
             settings_rows = {r["key"]: r["value"] for r in cur.fetchall()}
             _cache["bot_enabled"] = settings_rows.get("bot_enabled", "1") == "1"
             _cache["maintenance_message"] = settings_rows.get("maintenance_message") or DEFAULT_MAINTENANCE_MESSAGE
+            _cache["ai_persona"] = settings_rows.get("ai_persona") or DEFAULT_AI_PERSONA
 
             cur.execute("SELECT keyword, reply_text FROM keyword_replies WHERE enabled=1")
             _cache["keyword_replies"] = {r["keyword"]: r["reply_text"] for r in cur.fetchall()}
@@ -222,6 +228,10 @@ def get_sensitive_words() -> list:
 def get_maintenance_message() -> str:
     _refresh_cache_if_stale()
     return _cache["maintenance_message"] or DEFAULT_MAINTENANCE_MESSAGE
+
+def get_ai_persona() -> str:
+    _refresh_cache_if_stale()
+    return _cache["ai_persona"] or DEFAULT_AI_PERSONA
 
 def log_stat_event(event_type: str, target_id: str = None):
     """統計用事件記錄：機器人回覆則數、敏感詞觸發則數，供中控後台總覽頁使用"""
@@ -312,6 +322,36 @@ def get_real_mentions(event) -> list:
                 real_tagged_ids.append(u_id)
     return real_tagged_ids
 
+def get_mentions_with_amounts(event) -> list:
+    """回傳 [{"user_id":..., "amount": int|None}, ...]。
+    amount 是該次 @tag 後方緊接著的數字（例如「@小明 100」），沒有寫金額則為 None。
+    用於分攤功能判斷使用者是要「指定金額」還是單純「tag出要平分的人」。"""
+    results = []
+    mention = getattr(event.message, "mention", None)
+    if not (mention and mention.mentionees):
+        return results
+    text = getattr(event.message, "text", "")
+    for m in mention.mentionees:
+        u_id = getattr(m, "user_id", None)
+        if not u_id:
+            continue
+        try:
+            tagged_text = text[m.index : m.index + m.length]
+            if "米粒" in tagged_text:
+                continue
+        except Exception:
+            pass
+        amount = None
+        try:
+            after = text[m.index + m.length: m.index + m.length + 15]
+            amt_match = re.match(r'\s*\$?(\d+)', after)
+            if amt_match:
+                amount = int(amt_match.group(1))
+        except Exception:
+            pass
+        results.append({"user_id": u_id, "amount": amount})
+    return results
+
 def fetch_line_profile_name(user_id: str, target_id: str = None) -> str:
     """🎯 核心修復：升級為群組成員 API，未加好友也能抓到真實暱稱"""
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
@@ -397,7 +437,7 @@ def push_line_message(target_id: str, text: str):
 # 效期一到，下次判斷時就會自動視為未開通，不需要額外排程清除。
 # ==========================================
 TEST_FEATURE_KEYWORDS = {
-    "行程模式": "itinerary",
+    "旅行模式": "itinerary",
     "群組團單": "group_split",
     "收據辨識": "receipt_ocr",
 }
@@ -501,6 +541,8 @@ def try_handle_test_mode_gate(owner_type: str, owner_id: str, clean_text: str, r
         return False
 
     if is_test_mode_active(owner_type, owner_id, matched_feature):
+        if matched_feature == "itinerary":
+            return False  # 已開通的旅行模式再次輸入觸發詞，交給旅行流程處理（開始新的旅行規劃）
         label = TEST_FEATURE_LABELS[matched_feature]
         send_line_reply(reply_token, f"ℹ️「{label}」測試模式目前已經是啟用中的狀態囉！")
         return True
@@ -556,78 +598,520 @@ def estimate_travel_minutes(distance_km: float, mode: str = "drive") -> int:
     return max(1, round((distance_km / speed) * 60))
 
 # ==========================================
-# 🗓️ 7. 行程模式：新增／查詢／提醒推播
+# 🧳 7. 旅行模式：多輪對話式行程規劃
+# ------------------------------------------
+# 流程：旅行模式 → 問出發時間 → 問回程時間 → 建立草案
+#      → 逐筆輸入「日期時間 地點」→ 解析(regex優先,失敗交AI) → 地點確認 → 登記
+#      → 輸入「結束」→ AI給路線總覽建議 → 使用者「確定」或描述修改內容
+#      → 確定後以出發日期作為旅行單號，之後可用「旅行修改 單號」重新進入編輯
 # ==========================================
-ITINERARY_ADD_PATTERN = re.compile(
-    r'^(?:新增行程|行程)?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$'
-)
+DATETIME_PATTERN_COLON = re.compile(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})')
+DATETIME_PATTERN_COMPACT = re.compile(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{2})(\d{2})(?=\s|$)')
+TRIP_MODIFY_PATTERN = re.compile(r'^旅行修改\s*[+＋]?\s*(\d{6,20}(?:-\d+)?)$')
 
-def try_add_itinerary(owner_type: str, owner_id: str, creator_id: str, clean_text: str, reply_token: str) -> bool:
-    """輸入格式：2026/07/20 14:30 台北市政府（前面可加「新增行程」或「行程」字樣皆可辨識）"""
-    m = ITINERARY_ADD_PATTERN.match(clean_text)
-    if not m:
-        return False
+def parse_datetime_prefix(text: str):
+    """嘗試從文字開頭解析日期時間（支援「YYYY-MM-DD HH:MM」與「YYYY/M/D HHMM」兩種格式），
+    回傳 (datetime, 剩餘文字)；解析不到回傳 (None, None)"""
+    text = text.strip()
+    m = DATETIME_PATTERN_COLON.match(text)
+    if m:
+        y, mo, d, h, mi = map(int, m.groups())
+        try:
+            return datetime(y, mo, d, h, mi), text[m.end():].strip()
+        except ValueError:
+            return None, None
+    m = DATETIME_PATTERN_COMPACT.match(text)
+    if m:
+        y, mo, d, h, mi = map(int, m.groups())
+        try:
+            return datetime(y, mo, d, h, mi), text[m.end():].strip()
+        except ValueError:
+            return None, None
+    return None, None
 
-    date_str, time_str, location_name = m.groups()
-    date_str = date_str.replace("/", "-")
-    location_name = location_name.strip()
+class SimpleDateTimeExtraction(BaseModel):
+    datetime_str: str = Field(default="")
+    recognized: bool = Field(default=False)
+
+def ai_extract_datetime_only(text: str):
+    """交由 Gemini 判讀日期時間（規則沒抓到格式時的備援）"""
+    prompt = (
+        f"請從這段文字判讀出一個日期時間，用「YYYY-MM-DD HH:MM」24小時制格式回傳。"
+        f"若文字只提到時間、沒提到日期，可合理推斷為最近的未來日期。若完全無法判讀請將 recognized 設為 false。\n"
+        f"目前時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n文字：『{text}』"
+    )
     try:
-        scheduled_at = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    except ValueError:
-        send_line_reply(reply_token, "⚠️ 日期時間格式看不懂，請用「YYYY-MM-DD HH:MM 地點」的格式輸入，例如：\n2026-07-20 14:30 台北市政府")
-        return True
+        result = ai_client.models.generate_content(
+            model='gemini-2.5-flash', contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SimpleDateTimeExtraction, temperature=0.1),
+        ).parsed
+        if result and result.recognized and result.datetime_str:
+            try:
+                return datetime.strptime(result.datetime_str, "%Y-%m-%d %H:%M")
+            except Exception:
+                return None
+    except Exception as e:
+        log_error("AI日期時間辨識", e)
+    return None
 
-    if scheduled_at <= datetime.now():
-        send_line_reply(reply_token, "⚠️ 這個時間已經過去了，請輸入未來的行程時間。")
-        return True
+class ItineraryItemExtraction(BaseModel):
+    datetime_str: str = Field(default="")
+    location_name: str = Field(default="")
+    recognized: bool = Field(default=False)
 
-    lat, lon = geocode_location(location_name)
+def ai_extract_itinerary_item(text: str):
+    """交由 Gemini 同時判讀「日期時間」與「地點」（規則沒抓到格式時的備援，也用於處理 Google 地圖連結）"""
+    prompt = (
+        f"請從這段文字中判讀出「日期時間」與「地點」。日期時間請用「YYYY-MM-DD HH:MM」24小時制格式回傳；"
+        f"若文字中包含 Google 地圖連結或不完整地址，請盡量判斷出實際地點名稱（店家名稱、地標或地址）。"
+        f"若完全無法判讀日期時間，請將 recognized 設為 false。\n"
+        f"目前時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n文字：『{text}』"
+    )
+    try:
+        result = ai_client.models.generate_content(
+            model='gemini-2.5-flash', contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=ItineraryItemExtraction, temperature=0.1),
+        ).parsed
+        if result and result.recognized:
+            dt = None
+            try:
+                dt = datetime.strptime(result.datetime_str, "%Y-%m-%d %H:%M")
+            except Exception:
+                dt = None
+            return dt, (result.location_name.strip() if result.location_name else None)
+    except Exception as e:
+        log_error("AI行程項目辨識", e)
+    return None, None
 
+def is_maps_url(text: str) -> bool:
+    return bool(re.search(r'(maps\.google|goo\.gl/maps|maps\.app\.goo\.gl|google\.com/maps)', text, re.IGNORECASE))
+
+def try_extract_latlon_from_url(text: str):
+    """Google地圖連結常見的座標格式：.../@25.033,121.565,17z 或 ?q=25.033,121.565"""
+    m = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = re.search(r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)', text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return None, None
+
+# --- 旅行對話狀態（trip_sessions）存取 ---
+def get_trip_session(owner_type: str, owner_id: str):
     try:
         with db_cursor() as cur:
-            cur.execute(
-                """INSERT INTO itineraries
-                   (owner_type, owner_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (owner_type, owner_id, scheduled_at, location_name, lat, lon, creator_id)
-            )
+            cur.execute("SELECT * FROM trip_sessions WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
+            return cur.fetchone()
     except Exception as e:
-        log_error("行程新增", e, owner_id)
-        send_line_reply(reply_token, "⚠️ 行程登記失敗，請稍後再試一次。")
-        return True
+        log_error("旅行對話狀態查詢", e, owner_id)
+        return None
 
-    geo_note = "" if lat is not None else "\n⚠️ 這個地點沒有查到座標，屆時提醒訊息將不會包含通勤估算。"
+def set_trip_session(owner_type: str, owner_id: str, stage: str, trip_id=None, draft: dict = None):
+    with db_cursor() as cur:
+        cur.execute(
+            """INSERT INTO trip_sessions (owner_type, owner_id, stage, trip_id, draft_json)
+               VALUES (%s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE stage=VALUES(stage), trip_id=VALUES(trip_id), draft_json=VALUES(draft_json), updated_at=NOW()""",
+            (owner_type, owner_id, stage, trip_id, json.dumps(draft, ensure_ascii=False, default=str) if draft is not None else None)
+        )
+
+def clear_trip_session(owner_type: str, owner_id: str):
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM trip_sessions WHERE owner_type=%s AND owner_id=%s", (owner_type, owner_id))
+
+def build_trip_summary_text(trip_id: int) -> str:
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT scheduled_at, location_name FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC",
+            (trip_id,)
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "（目前尚未登記任何地點）"
+    return "\n".join(f"{i+1}. {r['scheduled_at'].strftime('%m/%d %H:%M')}　{r['location_name']}" for i, r in enumerate(rows))
+
+def ai_review_trip_route(departure_at: datetime, return_at: datetime, summary_text: str) -> str:
+    prompt = (
+        f"這是一趟旅行的行程安排，出發時間：{departure_at.strftime('%Y-%m-%d %H:%M')}，"
+        f"回程時間：{return_at.strftime('%Y-%m-%d %H:%M')}。行程列表：\n{summary_text}\n\n"
+        f"請用簡短親切的口吻（3-5句話內），評論這個行程安排是否合理（例如時間會不會太趕、順序是否需要調整），"
+        f"若有明顯問題請具體指出，沒有問題就給予正面回饋即可。"
+    )
+    try:
+        result = ai_client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        return (result.text or "").strip() or "行程看起來安排得不錯！"
+    except Exception as e:
+        log_error("AI路線建議", e)
+        return "（AI路線建議暫時無法取得，不影響行程登記）"
+
+class TripModification(BaseModel):
+    action: Literal["edit", "delete", "add", "update_times", "unclear"] = Field(default="unclear")
+    target_index: Optional[int] = Field(default=None)
+    new_datetime_str: str = Field(default="")
+    new_location: str = Field(default="")
+    new_departure_str: str = Field(default="")
+    new_return_str: str = Field(default="")
+
+def ai_apply_trip_modification(summary_text: str, departure_at: datetime, return_at: datetime, user_text: str) -> TripModification:
+    prompt = (
+        f"目前旅行行程如下（編號. 時間 地點）：\n{summary_text}\n"
+        f"出發時間：{departure_at.strftime('%Y-%m-%d %H:%M')}，回程時間：{return_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"使用者想這樣修改：『{user_text}』\n\n"
+        f"請判斷這是以下哪一種操作，並填入對應欄位（用不到的欄位留空字串）：\n"
+        f"- edit：修改某一項的時間或地點（填 target_index，以及要改的 new_datetime_str 和/或 new_location）\n"
+        f"- delete：刪除某一項（填 target_index）\n"
+        f"- add：新增一項（填 new_datetime_str 與 new_location）\n"
+        f"- update_times：修改整趟旅行的出發/回程時間（填 new_departure_str 和/或 new_return_str）\n"
+        f"- unclear：看不懂使用者想做什麼\n"
+        f"日期時間格式一律用「YYYY-MM-DD HH:MM」24小時制。"
+    )
+    try:
+        result = ai_client.models.generate_content(
+            model='gemini-2.5-flash', contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=TripModification, temperature=0.1),
+        ).parsed
+        return result or TripModification()
+    except Exception as e:
+        log_error("AI旅行修改判讀", e)
+        return TripModification()
+
+def generate_trip_code(owner_type: str, owner_id: str, departure_at: datetime) -> str:
+    base = departure_at.strftime("%Y%m%d")
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM trips WHERE owner_type=%s AND owner_id=%s AND trip_code LIKE %s",
+            (owner_type, owner_id, f"{base}%")
+        )
+        cnt = cur.fetchone()["cnt"]
+    return base if cnt == 0 else f"{base}-{cnt + 1}"
+
+def send_trip_review(owner_type: str, owner_id: str, trip: dict, reply_token: str):
+    summary = build_trip_summary_text(trip["id"])
+    ai_summary = ai_review_trip_route(trip["departure_at"], trip["return_at"], summary)
+    try:
+        with db_cursor() as cur:
+            cur.execute("UPDATE trips SET ai_route_summary=%s WHERE id=%s", (ai_summary, trip["id"]))
+    except Exception as e:
+        log_error("旅行路線建議寫入", e, owner_id)
+    set_trip_session(owner_type, owner_id, "pending_review", trip_id=trip["id"])
     send_line_reply(
         reply_token,
-        f"🗓️ 已登記行程：\n📍 {location_name}\n🕒 {scheduled_at.strftime('%Y-%m-%d %H:%M')}\n👉 出發前 15 分鐘會主動提醒您！{geo_note}"
+        f"🗺️ 【行程總覽】\n{summary}\n\n🤖 AI建議：{ai_summary}\n\n"
+        f"這樣安排OK嗎？回覆「確定」完成規劃並取得旅行單號，或直接輸入想修改的內容（例如：把第2項改成15:00 台北101、刪除第3項）。"
     )
-    return True
 
-def try_list_itineraries(owner_type: str, owner_id: str, clean_text: str, reply_token: str) -> bool:
-    if "查看行程" not in clean_text and "行程清單" not in clean_text:
+def try_handle_trip_flow(owner_type: str, owner_id: str, creator_id: str, clean_text: str, reply_token: str) -> bool:
+    """旅行模式的多輪對話總路由。回傳 True 代表這則訊息已被旅行流程處理完畢。"""
+    if not is_test_mode_active(owner_type, owner_id, "itinerary"):
         return False
-    try:
-        with db_cursor() as cur:
-            cur.execute(
-                """SELECT scheduled_at, location_name FROM itineraries
-                   WHERE owner_type=%s AND owner_id=%s AND scheduled_at > NOW()
-                   ORDER BY scheduled_at ASC LIMIT 10""",
-                (owner_type, owner_id)
-            )
-            rows = cur.fetchall()
-    except Exception as e:
-        log_error("行程查詢", e, owner_id)
-        send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
+
+    session = get_trip_session(owner_type, owner_id)
+
+    # 隨時可用「取消旅行」中止目前的規劃對話
+    if session and "取消旅行" in clean_text:
+        if session.get("trip_id") and session["stage"] != "pending_review":
+            try:
+                with db_cursor() as cur:
+                    cur.execute("DELETE FROM trips WHERE id=%s AND status='collecting'", (session["trip_id"],))
+            except Exception as e:
+                log_error("旅行草案刪除", e, owner_id)
+        clear_trip_session(owner_type, owner_id)
+        send_line_reply(reply_token, "🚫 已取消本次旅行規劃。")
         return True
 
-    if not rows:
-        send_line_reply(reply_token, "📭 目前沒有登記中的未來行程。\n👉 輸入「2026-07-20 14:30 台北市政府」即可新增。")
-    else:
-        lines = ["🗓️ 【未來行程清單】"]
-        for r in rows:
-            lines.append(f"・{r['scheduled_at'].strftime('%m/%d %H:%M')}　{r['location_name']}")
-        send_line_reply(reply_token, "\n".join(lines))
-    return True
+    # 「旅行修改 單號」：重新進入某趟已完成旅行的編輯
+    m = TRIP_MODIFY_PATTERN.match(clean_text)
+    if m and not session:
+        trip_code = m.group(1)
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM trips WHERE owner_type=%s AND owner_id=%s AND trip_code=%s",
+                    (owner_type, owner_id, trip_code)
+                )
+                trip = cur.fetchone()
+        except Exception as e:
+            log_error("旅行修改查詢", e, owner_id)
+            send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
+            return True
+        if not trip:
+            send_line_reply(reply_token, f"❌ 找不到旅行單號 #{trip_code}，請確認號碼是否正確。")
+            return True
+        send_trip_review(owner_type, owner_id, trip, reply_token)
+        return True
+
+    # 觸發詞：開始一趟新旅行（前提：目前沒有進行中的規劃對話）
+    if "旅行模式" in clean_text and not session:
+        set_trip_session(owner_type, owner_id, "pending_departure")
+        send_line_reply(
+            reply_token,
+            "🧳 開始規劃新旅行！請問這趟旅行的出發時間？\n"
+            "（格式：2026-07-19 19:00 或 2026/7/19 1900，也可以直接描述，我會請AI協助判讀）\n"
+            "隨時可輸入「取消旅行」中止規劃。"
+        )
+        return True
+
+    if not session:
+        return False
+
+    stage = session["stage"]
+
+    # --- Stage 1：等待出發時間 ---
+    if stage == "pending_departure":
+        dt, _ = parse_datetime_prefix(clean_text)
+        if dt is None:
+            dt = ai_extract_datetime_only(clean_text)
+        if dt is None:
+            send_line_reply(reply_token, "⚠️ 看不懂這個時間，請用「YYYY-MM-DD HH:MM」格式再試一次，例如：2026-07-19 19:00")
+            return True
+        set_trip_session(owner_type, owner_id, "pending_return", draft={"departure_at": dt.isoformat()})
+        send_line_reply(reply_token, f"📅 出發時間：{dt.strftime('%Y-%m-%d %H:%M')}\n請問預計的回程時間？")
+        return True
+
+    # --- Stage 2：等待回程時間 ---
+    if stage == "pending_return":
+        draft = json.loads(session["draft_json"] or "{}")
+        departure_at = datetime.fromisoformat(draft["departure_at"])
+        dt, _ = parse_datetime_prefix(clean_text)
+        if dt is None:
+            dt = ai_extract_datetime_only(clean_text)
+        if dt is None:
+            send_line_reply(reply_token, "⚠️ 看不懂這個時間，請用「YYYY-MM-DD HH:MM」格式再試一次。")
+            return True
+        if dt <= departure_at:
+            send_line_reply(reply_token, "⚠️ 回程時間必須晚於出發時間，請重新輸入。")
+            return True
+
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    """INSERT INTO trips (owner_type, owner_id, departure_at, return_at, status, created_by_uid)
+                       VALUES (%s, %s, %s, %s, 'collecting', %s)""",
+                    (owner_type, owner_id, departure_at, dt, creator_id)
+                )
+                trip_pk = cur.lastrowid
+        except Exception as e:
+            log_error("旅行建立", e, owner_id)
+            send_line_reply(reply_token, "⚠️ 旅行建立失敗，請稍後再試一次。")
+            return True
+
+        set_trip_session(owner_type, owner_id, "collecting", trip_id=trip_pk)
+        send_line_reply(
+            reply_token,
+            f"✅ 已建立旅行草案！\n📅 {departure_at.strftime('%Y-%m-%d %H:%M')} → {dt.strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"請開始輸入行程地點，格式：日期時間 地點，例如：\n2026-07-19 20:00 台北101\n（也可以直接貼 Google 地圖連結）\n\n"
+            f"全部輸入完畢後，請輸入「結束」進行總覽確認。"
+        )
+        return True
+
+    # --- Stage 3：收集行程地點 ---
+    if stage == "collecting":
+        trip_id = session["trip_id"]
+
+        if clean_text in ("結束", "完成", "結束規劃"):
+            try:
+                with db_cursor() as cur:
+                    cur.execute("SELECT * FROM trips WHERE id=%s", (trip_id,))
+                    trip = cur.fetchone()
+            except Exception as e:
+                log_error("旅行查詢", e, owner_id)
+                send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
+                return True
+            send_trip_review(owner_type, owner_id, trip, reply_token)
+            return True
+
+        dt, remainder = parse_datetime_prefix(clean_text)
+        location_text = remainder
+        maps_lat, maps_lon = (None, None)
+        if dt is None or not remainder:
+            if is_maps_url(clean_text):
+                maps_lat, maps_lon = try_extract_latlon_from_url(clean_text)
+            ai_dt, ai_loc = ai_extract_itinerary_item(clean_text)
+            dt = dt or ai_dt
+            location_text = location_text or ai_loc
+
+        if dt is None or not location_text:
+            send_line_reply(
+                reply_token,
+                "⚠️ 看不懂日期時間或地點，請用「日期時間 地點」格式再試一次，例如：\n2026-07-19 20:00 台北101\n或輸入「結束」完成規劃。"
+            )
+            return True
+
+        if maps_lat is not None:
+            lat, lon = maps_lat, maps_lon
+        else:
+            lat, lon = geocode_location(location_text)
+
+        draft = {"scheduled_at": dt.isoformat(), "location_name": location_text, "lat": lat, "lon": lon}
+        set_trip_session(owner_type, owner_id, "pending_location_confirm", trip_id=trip_id, draft=draft)
+        geo_note = "" if lat is not None else "\n⚠️ 這個地點沒有查到座標，將不會有通勤估算，但仍可正常登記。"
+        send_line_reply(
+            reply_token,
+            f"📍 地點解讀為：「{location_text}」\n🕒 {dt.strftime('%m/%d %H:%M')}\n"
+            f"這樣正確嗎？回覆「對」確認登記，或直接重新輸入地點名稱修正。{geo_note}"
+        )
+        return True
+
+    # --- Stage 4：等待地點確認 ---
+    if stage == "pending_location_confirm":
+        draft = json.loads(session["draft_json"] or "{}")
+        trip_id = session["trip_id"]
+
+        if any(k in clean_text for k in ["對", "是", "正確", "沒錯", "confirm", "OK", "ok"]):
+            dt = datetime.fromisoformat(draft["scheduled_at"])
+            try:
+                with db_cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO itineraries
+                           (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (owner_type, owner_id, trip_id, dt, draft["location_name"], draft.get("lat"), draft.get("lon"), creator_id)
+                    )
+            except Exception as e:
+                log_error("行程項目登記", e, owner_id)
+                send_line_reply(reply_token, "⚠️ 登記失敗，請稍後再試一次。")
+                return True
+            set_trip_session(owner_type, owner_id, "collecting", trip_id=trip_id)
+            send_line_reply(reply_token, f"✅ 已登記：{dt.strftime('%m/%d %H:%M')} {draft['location_name']}\n請繼續輸入下一個行程，或輸入「結束」完成規劃。")
+            return True
+
+        # 不是確認回覆 → 當作重新輸入的地點名稱，沿用原本的日期時間重新解析
+        new_location_text = clean_text
+        maps_lat, maps_lon = (None, None)
+        if is_maps_url(new_location_text):
+            maps_lat, maps_lon = try_extract_latlon_from_url(new_location_text)
+            ai_loc = ai_extract_location_name(new_location_text) if maps_lat is None else None
+            if ai_loc:
+                new_location_text = ai_loc
+        lat, lon = (maps_lat, maps_lon) if maps_lat is not None else geocode_location(new_location_text)
+
+        draft.update({"location_name": new_location_text, "lat": lat, "lon": lon})
+        set_trip_session(owner_type, owner_id, "pending_location_confirm", trip_id=trip_id, draft=draft)
+        dt = datetime.fromisoformat(draft["scheduled_at"])
+        geo_note = "" if lat is not None else "\n⚠️ 這個地點沒有查到座標，將不會有通勤估算，但仍可正常登記。"
+        send_line_reply(
+            reply_token,
+            f"📍 地點解讀為：「{new_location_text}」\n🕒 {dt.strftime('%m/%d %H:%M')}\n"
+            f"這樣正確嗎？回覆「對」確認登記，或直接重新輸入地點名稱修正。{geo_note}"
+        )
+        return True
+
+    # --- Stage 5：等待總覽確認或修改指示 ---
+    if stage == "pending_review":
+        trip_id = session["trip_id"]
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT * FROM trips WHERE id=%s", (trip_id,))
+                trip = cur.fetchone()
+        except Exception as e:
+            log_error("旅行查詢", e, owner_id)
+            send_line_reply(reply_token, "⚠️ 查詢失敗，請稍後再試一次。")
+            return True
+        if not trip:
+            clear_trip_session(owner_type, owner_id)
+            return False
+
+        if any(k in clean_text for k in ["確定", "OK", "ok", "沒問題", "可以"]):
+            if trip["status"] != "confirmed":
+                trip_code = generate_trip_code(owner_type, owner_id, trip["departure_at"])
+                try:
+                    with db_cursor() as cur:
+                        cur.execute("UPDATE trips SET status='confirmed', trip_code=%s WHERE id=%s", (trip_code, trip_id))
+                except Exception as e:
+                    log_error("旅行確認寫入", e, owner_id)
+                    send_line_reply(reply_token, "⚠️ 確認失敗，請稍後再試一次。")
+                    return True
+            else:
+                trip_code = trip["trip_code"]
+            clear_trip_session(owner_type, owner_id)
+            send_line_reply(
+                reply_token,
+                f"🎉 旅行規劃完成！旅行單號：#{trip_code}\n"
+                f"👉 之後可輸入「旅行修改 {trip_code}」重新編輯，行程開始前 45 分鐘我會主動提醒您！"
+            )
+            return True
+
+        # 其餘文字視為修改指示，交給 AI 判讀
+        summary = build_trip_summary_text(trip_id)
+        mod = ai_apply_trip_modification(summary, trip["departure_at"], trip["return_at"], clean_text)
+
+        if mod.action == "delete" and mod.target_index:
+            try:
+                with db_cursor() as cur:
+                    cur.execute("SELECT id FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC", (trip_id,))
+                    rows = cur.fetchall()
+                    if 1 <= mod.target_index <= len(rows):
+                        cur.execute("DELETE FROM itineraries WHERE id=%s", (rows[mod.target_index - 1]["id"],))
+            except Exception as e:
+                log_error("旅行修改-刪除", e, owner_id)
+
+        elif mod.action == "edit" and mod.target_index:
+            try:
+                with db_cursor() as cur:
+                    cur.execute("SELECT id, scheduled_at, location_name FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC", (trip_id,))
+                    rows = cur.fetchall()
+                    if 1 <= mod.target_index <= len(rows):
+                        target = rows[mod.target_index - 1]
+                        new_dt = target["scheduled_at"]
+                        new_loc = target["location_name"]
+                        if mod.new_datetime_str:
+                            try:
+                                new_dt = datetime.strptime(mod.new_datetime_str, "%Y-%m-%d %H:%M")
+                            except Exception:
+                                pass
+                        if mod.new_location:
+                            new_loc = mod.new_location
+                        lat, lon = geocode_location(new_loc) if mod.new_location else (None, None)
+                        if mod.new_location:
+                            cur.execute("UPDATE itineraries SET scheduled_at=%s, location_name=%s, latitude=%s, longitude=%s, notified=0 WHERE id=%s",
+                                        (new_dt, new_loc, lat, lon, target["id"]))
+                        else:
+                            cur.execute("UPDATE itineraries SET scheduled_at=%s, notified=0 WHERE id=%s", (new_dt, target["id"]))
+            except Exception as e:
+                log_error("旅行修改-編輯", e, owner_id)
+
+        elif mod.action == "add" and mod.new_datetime_str and mod.new_location:
+            try:
+                new_dt = datetime.strptime(mod.new_datetime_str, "%Y-%m-%d %H:%M")
+                lat, lon = geocode_location(mod.new_location)
+                with db_cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO itineraries (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (owner_type, owner_id, trip_id, new_dt, mod.new_location, lat, lon, creator_id)
+                    )
+            except Exception as e:
+                log_error("旅行修改-新增", e, owner_id)
+
+        elif mod.action == "update_times":
+            try:
+                new_dep = datetime.strptime(mod.new_departure_str, "%Y-%m-%d %H:%M") if mod.new_departure_str else trip["departure_at"]
+                new_ret = datetime.strptime(mod.new_return_str, "%Y-%m-%d %H:%M") if mod.new_return_str else trip["return_at"]
+                with db_cursor() as cur:
+                    cur.execute("UPDATE trips SET departure_at=%s, return_at=%s WHERE id=%s", (new_dep, new_ret, trip_id))
+            except Exception as e:
+                log_error("旅行修改-時間", e, owner_id)
+
+        else:
+            send_line_reply(reply_token, "⚠️ 不太確定您要修改的內容，請具體描述，例如：「把第2項改成15:00 台北101」「刪除第3項」「新增 2026-07-20 09:00 早餐店」。")
+            return True
+
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT * FROM trips WHERE id=%s", (trip_id,))
+                trip = cur.fetchone()
+        except Exception as e:
+            log_error("旅行查詢", e, owner_id)
+            return True
+        send_trip_review(owner_type, owner_id, trip, reply_token)
+        return True
+
+    return False
+
+def ai_extract_location_name(text: str):
+    """輔助函式：僅需要地點名稱時使用（例如地點確認階段重新輸入 Google 地圖連結）"""
+    _, loc = ai_extract_itinerary_item(text)
+    return loc
 
 def send_itinerary_reminder(it: dict):
     owner_type = it["owner_type"]
@@ -670,12 +1154,12 @@ def send_itinerary_reminder(it: dict):
         log_error("行程待確認寫入", e, owner_id)
 
 def check_and_send_itinerary_reminders():
-    """由背景排程每分鐘呼叫一次：找出 14~16 分鐘後即將開始、還沒提醒過的行程"""
+    """由背景排程每分鐘呼叫一次：找出 44~46 分鐘後即將開始、還沒提醒過的行程"""
     if not DB_READY:
         return
     now = datetime.now()
-    window_start = now + timedelta(minutes=14)
-    window_end = now + timedelta(minutes=16)
+    window_start = now + timedelta(minutes=44)
+    window_end = now + timedelta(minutes=46)
     try:
         with db_cursor() as cur:
             cur.execute(
@@ -775,7 +1259,17 @@ def create_split_order(group_id: str, payer_id: str, payer_name: str, items: lis
     n = max(1, len(participants))
     base_share = total // n
     remainder = total - base_share * n
+    custom = [{"user_id": p["user_id"], "display_name": p["display_name"],
+               "amount": base_share + (remainder if idx == 0 else 0)} for idx, p in enumerate(participants)]
+    return create_split_order_custom(group_id, payer_id, payer_name, items, custom)
 
+def create_split_order_custom(group_id: str, payer_id: str, payer_name: str, items: list, participant_amounts: list) -> str:
+    """
+    participant_amounts: [{"user_id": str, "display_name": str, "amount": int}, ...]（每人分攤的確切金額）
+    用於「均分」（外層先算好平分金額）與「指定金額」（使用者自己在 @tag 後面打金額）共用。
+    回傳新產生的 4 碼團單號
+    """
+    total = sum(i["price"] for i in items)
     code_str = str(random.randint(1000, 9999))
     with db_cursor() as cur:
         cur.execute(
@@ -785,17 +1279,16 @@ def create_split_order(group_id: str, payer_id: str, payer_name: str, items: lis
         )
         order_pk = cur.lastrowid
         item_label = "、".join(i["item_name"] for i in items) if len(items) <= 3 else f"{items[0]['item_name']}等{len(items)}項"
-        for idx, p in enumerate(participants):
-            share = base_share + (remainder if idx == 0 else 0)  # 餘數歸給第一位（通常是付款人自己）
+        for p in participant_amounts:
             cur.execute(
                 """INSERT INTO order_items (group_id, order_code, order_id, buyer_id, buyer_name, item_name, price)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (group_id, code_str, order_pk, p["user_id"], p["display_name"], item_label, share)
+                (group_id, code_str, order_pk, p["user_id"], p["display_name"], item_label, p["amount"])
             )
     return code_str
 
 def try_handle_group_split_reply(group_id: str, event, clean_text: str, creator_id: str, reply_token: str) -> bool:
-    """處理群組團單詢問後，使用者回覆「均分／@tag／跳過」"""
+    """處理群組團單詢問後，使用者回覆「均分／@tag／@tag+金額指定／跳過」"""
     try:
         with db_cursor() as cur:
             cur.execute(
@@ -819,9 +1312,10 @@ def try_handle_group_split_reply(group_id: str, event, clean_text: str, creator_
 
     items = json.loads(row["items_json"])
     payer_id, payer_name = row["payer_id"], row["payer_name"]
-    real_tagged_ids = get_real_mentions(event)
+    mentions = get_mentions_with_amounts(event)
+    real_tagged_ids = [m["user_id"] for m in mentions]
     is_skip = any(k in clean_text for k in ["跳過", "不分攤", "算了", "略過"])
-    is_split_even = any(k in clean_text for k in ["均分", "平分", "平攤"])
+    is_split_even = any(k in clean_text for k in ["均分", "平分", "平攤"]) and not real_tagged_ids
 
     if not (is_skip or is_split_even or real_tagged_ids):
         return False  # 不是在回答這個問題
@@ -848,6 +1342,33 @@ def try_handle_group_split_reply(group_id: str, event, clean_text: str, creator_
             send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
         return True
 
+    # 🎯 指定金額模式：使用者在每個 @tag 後面都有打金額，例如「@小明 100 @小華 50」
+    has_all_amounts = bool(mentions) and all(m["amount"] is not None for m in mentions)
+
+    if has_all_amounts:
+        participant_amounts = [
+            {"user_id": m["user_id"], "display_name": resolve_id_to_name(group_id, m["user_id"]), "amount": m["amount"]}
+            for m in mentions
+        ]
+        specified_total = sum(p["amount"] for p in participant_amounts)
+        try:
+            code_str = create_split_order_custom(group_id, payer_id, payer_name, items, participant_amounts)
+        except Exception as e:
+            log_error("指定金額分攤建單", e, group_id)
+            send_line_reply(reply_token, "⚠️ 分攤登記失敗，請稍後再試一次。")
+            return True
+
+        names = "、".join(f"{p['display_name']} ${p['amount']}" for p in participant_amounts)
+        mismatch_note = ""
+        if specified_total != row["total_amount"]:
+            mismatch_note = f"\n⚠️ 提醒：指定金額總和 ${specified_total} 與原始花費 ${row['total_amount']} 不同，已依您指定的金額登記，如需調整可用「修改」指令。"
+        send_line_reply(
+            reply_token,
+            f"✅ 已依指定金額登記分攤！團單號：#{code_str}\n👥 {names}{mismatch_note}\n👉 之後可輸入「核銷 #{code_str}」開始對帳。"
+        )
+        return True
+
+    # 🎯 均分模式：純 @tag（沒有金額）或直接回覆「均分」
     if real_tagged_ids:
         participants = [{"user_id": uid, "display_name": resolve_id_to_name(group_id, uid)} for uid in real_tagged_ids]
     else:
@@ -890,7 +1411,8 @@ def try_start_group_split_question(group_id: str, item_name: str, amount: int, p
         f"💰 {item_name} ${amount}，這筆怎麼記？\n"
         f"1️⃣ 回覆「均分」→ 平分給已知的群組成員\n"
         f"2️⃣ tag 出實際分攤的人（例如 @小明 @小華）→ 平分給這些人\n"
-        f"3️⃣ 回覆「跳過」→ 記一般花費，不分攤"
+        f"3️⃣ tag 並在後面加金額（例如 @小明 100 @小華 50）→ 指定每人分攤的金額\n"
+        f"4️⃣ 回覆「跳過」→ 記一般花費，不分攤"
     )
     return True
 
@@ -965,21 +1487,29 @@ def try_handle_edit_order_item(group_id: str, clean_text: str, reply_token: str)
 def handle_receipt_image(owner_type: str, owner_id: str, is_group: bool, creator_id: str, creator_name: str, reply_token: str, message_id: str):
     try:
         image_bytes = download_line_image(message_id)
+    except httpx.TimeoutException as e:
+        log_error("收據圖片下載逾時", e, owner_id)
+        send_line_reply(reply_token, "⚠️ 收據辨識失敗：圖片下載逾時，請確認網路狀況後重新傳送一次。")
+        return
     except Exception as e:
         log_error("收據圖片下載", e, owner_id)
-        send_line_reply(reply_token, "⚠️ 圖片下載失敗，請重新傳送一次。")
+        send_line_reply(reply_token, "⚠️ 收據辨識失敗：圖片下載發生問題，請重新傳送一次。")
         return
 
     try:
         extraction = extract_receipt(image_bytes)
     except Exception as e:
-        log_error("收據辨識", e, owner_id)
-        send_line_reply(reply_token, "⚠️ 收據辨識失敗，可能圖片不夠清晰，請重新拍攝後再試一次。")
+        log_error("收據辨識(AI串接)", e, owner_id)
+        send_line_reply(reply_token, f"⚠️ 收據辨識失敗：AI 辨識服務串接發生問題，請稍後再試一次。\n（若持續發生，麻煩回報管理員：{str(e)[:80]}）")
+        return
+
+    if extraction is None:
+        send_line_reply(reply_token, "⚠️ 收據辨識失敗：AI 沒有回傳可用的結果，請稍後再試一次。")
         return
 
     items = [{"item_name": i.item_name or "未命名品項", "price": i.price} for i in extraction.items if i.price > 0]
     if not items:
-        send_line_reply(reply_token, "⚠️ 沒有辨識到任何品項金額，請確認收據是否清晰完整。")
+        send_line_reply(reply_token, "⚠️ 收據辨識失敗：沒有辨識到任何品項金額，可能是照片模糊不清、角度傾斜或收據不完整，請重新拍攝清晰、平整的照片後再試一次。")
         return
 
     total = extraction.total_amount if extraction.total_amount > 0 else sum(i["price"] for i in items)
@@ -1021,7 +1551,7 @@ def handle_receipt_image(owner_type: str, owner_id: str, is_group: bool, creator
     send_line_reply(
         reply_token,
         f"🧾 收據辨識完成：\n{item_lines}\n💰 合計：${total}\n\n"
-        f"這筆怎麼記？\n1️⃣ 回覆「均分」→ 平分給已知群組成員\n2️⃣ tag 出實際分攤的人\n3️⃣ 回覆「跳過」→ 記一般花費\n\n"
+        f"這筆怎麼記？\n1️⃣ 回覆「均分」→ 平分給已知群組成員\n2️⃣ tag 出實際分攤的人\n3️⃣ tag 並加金額（例如 @小明 100 @小華 50）→ 指定金額\n4️⃣ 回覆「跳過」→ 記一般花費\n\n"
         f"若品項或金額有誤，登記完成後可輸入「修改 單號 項次 品項 金額」修正，例如：修改 1234 2 拿鐵 65"
     )
 
@@ -1089,13 +1619,16 @@ def handle_text_message(event):
     # ====================================================
     # 🧪 【測試限定功能：密碼驗證 / 待回覆狀態攔截層】
     # ------------------------------------------------------
-    # 優先序：密碼驗證 > 行程「有/無」回覆 > 群組分攤「均分/@tag/跳過」回覆
+    # 優先序：密碼驗證 > 旅行模式多輪對話 > 行程「有/無」回覆 > 群組分攤「均分/@tag/跳過」回覆
     # 這幾層都是「上一則機器人訊息在等待使用者回覆」的情境，
     # 必須搶在核銷、開團等既有邏輯之前處理，否則會被其他規則誤判掉。
     # ====================================================
     _gate_text = user_text.replace("@記帳米粒", "").replace("記帳米粒", "").strip()
 
     if try_handle_test_mode_gate(owner_type, target_id, _gate_text, reply_token):
+        return
+
+    if try_handle_trip_flow(owner_type, target_id, creator_id, _gate_text, reply_token):
         return
 
     if try_handle_itinerary_confirm_reply(owner_type, target_id, _gate_text, is_group, target_id, reply_token):
@@ -1230,15 +1763,6 @@ def handle_text_message(event):
     clean_text = user_text.replace("@記帳米粒", "").replace("記帳米粒", "").strip()
 
     # ====================================================
-    # 🗓️ 【測試限定：行程模式 - 新增／查詢行程】
-    # ====================================================
-    if is_test_mode_active(owner_type, target_id, "itinerary"):
-        if try_add_itinerary(owner_type, target_id, creator_id, clean_text, reply_token):
-            return
-        if try_list_itineraries(owner_type, target_id, clean_text, reply_token):
-            return
-
-    # ====================================================
     # 🧾 【測試限定：收據辨識 - 修改已登記的品項】
     # ====================================================
     if is_group and is_test_mode_active(owner_type, target_id, "receipt_ocr"):
@@ -1368,7 +1892,7 @@ def handle_text_message(event):
     # ====================================================
     try:
         prompt = f"""
-        你是一個親切、幽默的記帳助理「記帳米粒」。目前位於【{root_collection}】環境，模式為【{current_mode}】。
+        {get_ai_persona()}目前位於【{root_collection}】環境，模式為【{current_mode}】。
         使用者輸入了：『{clean_text}』
         
         【分流任務】：
@@ -1486,9 +2010,9 @@ def handle_text_message(event):
 
 @line_handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
-    """🧾 測試限定：收據辨識入口。圖片訊息無法像文字一樣 @tag 機器人，
+    """🧾 收據辨識入口。圖片訊息無法像文字一樣 @tag 機器人，
     因此只要該使用者/群組已開通「收據辨識」測試模式，收到圖片就會直接處理，
-    不用另外要求 tag。"""
+    不用另外要求 tag。未開通時也一律要回覆，不能靜默忽略（避免使用者誤以為機器人壞了）。"""
     if not DB_READY or not is_bot_enabled():
         return
 
@@ -1500,7 +2024,8 @@ def handle_image_message(event):
     message_id = event.message.id
 
     if not is_test_mode_active(owner_type, target_id, "receipt_ocr"):
-        return  # 未開通測試模式時，靜默忽略圖片，避免一般使用者誤傳照片收到困惑訊息
+        send_line_reply(reply_token, "🔐「收據辨識」為測試限定功能，請先輸入「收據辨識」並完成密碼驗證後，才能傳照片辨識喔！")
+        return
 
     creator_name = resolve_id_to_name(target_id, creator_id)
     handle_receipt_image(owner_type, target_id, is_group, creator_id, creator_name, reply_token, message_id)
