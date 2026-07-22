@@ -1,0 +1,406 @@
+"""
+監控後台（index.html）呼叫的 REST API：記帳查詢/編輯、群組狀態、
+團單核銷、旅行規劃的查詢與增刪修。全部掛在同一個 APIRouter，
+main.py 用 app.include_router(router) 掛載即可。
+"""
+from datetime import datetime
+from typing import Literal, Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.db import db_cursor, is_db_ready
+from app.geo import geocode_location
+
+router = APIRouter()
+
+# ==========================================
+class ExpenseUpdate(BaseModel):
+    item: str
+    amount: int
+
+class GroupStateUpdate(BaseModel):
+    state: Literal["normal", "order", "settle"]
+
+class OrderItemUpdate(BaseModel):
+    buyer_name: str
+    item_name: str
+    price: int
+
+
+def _require_db():
+    if not is_db_ready():
+        raise HTTPException(status_code=503, detail="資料庫尚未就緒")
+
+
+@router.get("/api/expenses")
+def api_list_expenses(
+    owner_type: Literal["user", "group"],
+    owner_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    record_type: Optional[str] = None,
+):
+    """個人/群組首頁流水帳、進階查詢共用：依日期區間、收支類型篩選"""
+    _require_db()
+    sql = "SELECT id, record_type, amount, item, category, created_by_name, created_at FROM expenses WHERE owner_type=%s AND owner_id=%s"
+    params = [owner_type, owner_id]
+    if start:
+        sql += " AND created_at >= %s"
+        params.append(f"{start} 00:00:00")
+    if end:
+        sql += " AND created_at <= %s"
+        params.append(f"{end} 23:59:59")
+    if record_type and record_type != "all":
+        sql += " AND record_type = %s"
+        params.append(record_type)
+    sql += " ORDER BY created_at DESC"
+    try:
+        with db_cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        for r in rows:
+            r["created_at"] = r["created_at"].isoformat()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/api/expenses/{expense_id}")
+def api_update_expense(expense_id: int, body: ExpenseUpdate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "UPDATE expenses SET item=%s, amount=%s WHERE id=%s",
+                (body.item, body.amount, expense_id)
+            )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/expenses/{expense_id}")
+def api_delete_expense(expense_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM expenses WHERE id=%s", (expense_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/groups/{group_id}")
+def api_get_group(group_id: str):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT group_id, state, active_order_code FROM `groups` WHERE group_id=%s", (group_id,))
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="找不到此群組")
+        return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/api/groups/{group_id}/state")
+def api_update_group_state(group_id: str, body: GroupStateUpdate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("UPDATE `groups` SET state=%s WHERE group_id=%s", (body.state, group_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/groups/{group_id}/payer-summary")
+def api_payer_summary(group_id: str):
+    """群組成員歷史累計墊付排行（管理頁的甜甜圈圖用）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT created_by_name, COALESCE(SUM(amount),0) AS total
+                   FROM expenses
+                   WHERE owner_type='group' AND owner_id=%s AND record_type != 'income'
+                   GROUP BY created_by_name
+                   ORDER BY total DESC""",
+                (group_id,)
+            )
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/groups/{group_id}/orders")
+def api_list_orders(group_id: str):
+    """歷史揪團訂單清單，並附上每個訂單的成員應付/已付明細（後端算好，前端不用再算）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT id, order_code, order_name, order_date, total_amount, master_payer_name, created_at
+                   FROM orders WHERE group_id=%s ORDER BY created_at DESC""",
+                (group_id,)
+            )
+            orders = cur.fetchall()
+
+            cur.execute(
+                "SELECT payer_name, order_code_ref, amount FROM settlements WHERE group_id=%s",
+                (group_id,)
+            )
+            settlements = cur.fetchall()
+
+            for o in orders:
+                cur.execute(
+                    "SELECT id, buyer_name, item_name, price FROM order_items WHERE order_id=%s ORDER BY id ASC",
+                    (o["id"],)
+                )
+                o["items"] = cur.fetchall()
+                o["created_at"] = o["created_at"].isoformat()
+                if hasattr(o["order_date"], "isoformat"):
+                    o["order_date"] = o["order_date"].isoformat()
+
+                expected = {}
+                for item in o["items"]:
+                    expected[item["buyer_name"]] = expected.get(item["buyer_name"], 0) + item["price"]
+                actual = {}
+                for s in settlements:
+                    if s["order_code_ref"] == o["order_code"]:
+                        actual[s["payer_name"]] = actual.get(s["payer_name"], 0) + s["amount"]
+                o["expected"] = expected
+                o["actual"] = actual
+
+        return orders
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/api/order-items/{item_id}")
+def api_update_order_item(item_id: int, body: OrderItemUpdate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT order_id FROM order_items WHERE id=%s", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="找不到此品項")
+            cur.execute(
+                "UPDATE order_items SET buyer_name=%s, item_name=%s, price=%s WHERE id=%s",
+                (body.buyer_name, body.item_name, body.price, item_id)
+            )
+            if row["order_id"]:
+                cur.execute(
+                    "UPDATE orders SET total_amount=(SELECT COALESCE(SUM(price),0) FROM order_items WHERE order_id=%s) WHERE id=%s",
+                    (row["order_id"], row["order_id"])
+                )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/order-items/{item_id}")
+def api_delete_order_item(item_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT order_id FROM order_items WHERE id=%s", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="找不到此品項")
+            cur.execute("DELETE FROM order_items WHERE id=%s", (item_id,))
+            if row["order_id"]:
+                cur.execute(
+                    "UPDATE orders SET total_amount=(SELECT COALESCE(SUM(price),0) FROM order_items WHERE order_id=%s) WHERE id=%s",
+                    (row["order_id"], row["order_id"])
+                )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/groups/{group_id}/orders/{order_id}")
+def api_delete_order(group_id: str, order_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM order_items WHERE order_id=%s AND group_id=%s", (order_id, group_id))
+            cur.execute("DELETE FROM orders WHERE id=%s AND group_id=%s", (order_id, group_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 🧳 旅行功能 REST API（BETA，供 index.html 顯示/增減修正旅行規劃）
+# ==========================================
+class TripCreate(BaseModel):
+    owner_type: Literal["user", "group"]
+    owner_id: str
+    departure_at: str  # "YYYY-MM-DD HH:MM"
+    return_at: str
+
+class TripTimesUpdate(BaseModel):
+    departure_at: str
+    return_at: str
+
+class ItineraryItemCreate(BaseModel):
+    scheduled_at: str  # "YYYY-MM-DD HH:MM"
+    location_name: str
+
+class ItineraryItemUpdate(BaseModel):
+    scheduled_at: str
+    location_name: str
+
+def _parse_dt(s: str) -> datetime:
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期時間格式錯誤，請用 YYYY-MM-DD HH:MM")
+
+@router.get("/api/trips")
+def api_list_trips(owner_type: Literal["user", "group"], owner_id: str):
+    """列出該使用者/群組的所有旅行（含已完成規劃與進行中的草案），並附上每趟旅行的行程項目明細"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT id, trip_code, departure_at, return_at, status, ai_route_summary, created_at
+                   FROM trips WHERE owner_type=%s AND owner_id=%s ORDER BY departure_at DESC""",
+                (owner_type, owner_id)
+            )
+            trips = cur.fetchall()
+            for t in trips:
+                cur.execute(
+                    "SELECT id, scheduled_at, location_name, notified FROM itineraries WHERE trip_id=%s ORDER BY scheduled_at ASC",
+                    (t["id"],)
+                )
+                items = cur.fetchall()
+                for it in items:
+                    it["scheduled_at"] = it["scheduled_at"].isoformat()
+                t["items"] = items
+                t["departure_at"] = t["departure_at"].isoformat()
+                t["return_at"] = t["return_at"].isoformat()
+                t["created_at"] = t["created_at"].isoformat()
+        return trips
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/trips")
+def api_create_trip(body: TripCreate):
+    """中控後台直接新增一趟旅行（不經過 LINE 對話流程），建立時即視為已確認並產生旅行單號"""
+    _require_db()
+    departure_at = _parse_dt(body.departure_at)
+    return_at = _parse_dt(body.return_at)
+    if return_at <= departure_at:
+        raise HTTPException(status_code=400, detail="回程時間必須晚於出發時間")
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO trips (owner_type, owner_id, departure_at, return_at, status, created_by_uid)
+                   VALUES (%s, %s, %s, %s, 'collecting', 'admin-panel')""",
+                (body.owner_type, body.owner_id, departure_at, return_at)
+            )
+            trip_id = cur.lastrowid
+            trip_code = departure_at.strftime("%Y%m%d")
+            cur.execute("SELECT COUNT(*) AS cnt FROM trips WHERE owner_type=%s AND owner_id=%s AND trip_code LIKE %s",
+                        (body.owner_type, body.owner_id, f"{trip_code}%"))
+            cnt = cur.fetchone()["cnt"]
+            if cnt > 0:
+                trip_code = f"{trip_code}-{cnt + 1}"
+            cur.execute("UPDATE trips SET status='confirmed', trip_code=%s WHERE id=%s", (trip_code, trip_id))
+        return {"ok": True, "id": trip_id, "trip_code": trip_code}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.patch("/api/trips/{trip_id}")
+def api_update_trip_times(trip_id: int, body: TripTimesUpdate):
+    """編輯一趟旅行的出發／回程時間"""
+    _require_db()
+    departure_at = _parse_dt(body.departure_at)
+    return_at = _parse_dt(body.return_at)
+    if return_at <= departure_at:
+        raise HTTPException(status_code=400, detail="回程時間必須晚於出發時間")
+    try:
+        with db_cursor() as cur:
+            cur.execute("UPDATE trips SET departure_at=%s, return_at=%s WHERE id=%s", (departure_at, return_at, trip_id))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/api/trips/{trip_id}")
+def api_delete_trip(trip_id: int):
+    """刪除一趟旅行（含底下所有行程項目，靠外鍵 CASCADE 一併清除）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM trips WHERE id=%s", (trip_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/trips/{trip_id}/items")
+def api_add_trip_item(trip_id: int, body: ItineraryItemCreate):
+    """新增一個行程項目到指定旅行（座標會自動地理編碼，查不到也不影響新增）"""
+    _require_db()
+    scheduled_at = _parse_dt(body.scheduled_at)
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT owner_type, owner_id FROM trips WHERE id=%s", (trip_id,))
+            trip = cur.fetchone()
+            if not trip:
+                raise HTTPException(status_code=404, detail="找不到此旅行")
+            lat, lon = geocode_location(body.location_name)
+            cur.execute(
+                """INSERT INTO itineraries (owner_type, owner_id, trip_id, scheduled_at, location_name, latitude, longitude, created_by_uid)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'admin-panel')""",
+                (trip["owner_type"], trip["owner_id"], trip_id, scheduled_at, body.location_name.strip(), lat, lon)
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.patch("/api/itinerary-items/{item_id}")
+def api_update_trip_item(item_id: int, body: ItineraryItemUpdate):
+    """編輯行程項目的時間／地點（地點若有變更會重新地理編碼），並重置提醒狀態"""
+    _require_db()
+    scheduled_at = _parse_dt(body.scheduled_at)
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT location_name FROM itineraries WHERE id=%s", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="找不到此行程項目")
+            if body.location_name.strip() != row["location_name"]:
+                lat, lon = geocode_location(body.location_name)
+                cur.execute(
+                    "UPDATE itineraries SET scheduled_at=%s, location_name=%s, latitude=%s, longitude=%s, notified=0 WHERE id=%s",
+                    (scheduled_at, body.location_name.strip(), lat, lon, item_id)
+                )
+            else:
+                cur.execute("UPDATE itineraries SET scheduled_at=%s, notified=0 WHERE id=%s", (scheduled_at, item_id))
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/api/itinerary-items/{item_id}")
+def api_delete_trip_item(item_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM itineraries WHERE id=%s", (item_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
