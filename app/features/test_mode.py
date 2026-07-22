@@ -14,6 +14,7 @@ from app.config import TEST_MODE_PASSWORD, TEST_MODE_HOURS
 from app.db import db_cursor, is_db_ready
 from app.logging_utils import log_error
 from app.line_client import send_line_reply
+from app.feature_switches import is_feature_enabled, get_feature_maintenance_message
 
 TEST_FEATURE_KEYWORDS = {
     "旅行模式": "itinerary",
@@ -161,6 +162,10 @@ def try_handle_test_mode_gate(owner_type: str, owner_id: str, clean_text: str, r
             break
     if not matched_feature:
         return False
+
+    if not is_feature_enabled(matched_feature):
+        send_line_reply(reply_token, get_feature_maintenance_message(matched_feature))
+        return True
 
     if is_test_mode_active(owner_type, owner_id, matched_feature):
         if matched_feature == "itinerary":

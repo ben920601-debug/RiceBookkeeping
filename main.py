@@ -37,6 +37,7 @@ from app.features.receipt import try_handle_receipt_naming_reply, try_handle_edi
 from app.features.bills import try_add_bill, try_list_bills, try_reconcile_bill, bill_reminder_loop
 from app.features.savings import try_add_jar, try_save_money, try_list_jars
 from app.payment_method import try_extract_payment_method
+from app.feature_switches import is_feature_enabled
 
 from app.api.routes import router as api_router
 
@@ -412,7 +413,7 @@ def handle_text_message(event):
 
                 # 🍱 群組團單分攤（V1.7 起為群組主要功能，不再需要測試模式開通）
                 # 群組、支出（非收入）時，改為詢問「均分／@tag／跳過」，而不是直接寫入一般記帳
-                if is_group and not is_income_quick:
+                if is_group and not is_income_quick and is_feature_enabled("group_split"):
                     if try_start_group_split_question(target_id, item_name, amount, creator_id, creator_name_str, reply_token):
                         return
 

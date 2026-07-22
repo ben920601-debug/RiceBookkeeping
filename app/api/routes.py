@@ -672,3 +672,34 @@ def api_delete_payment_method(method_id: int):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# 🖥️ 監控後台整體設定 REST API（開關、跑馬燈、各功能狀態標籤）
+# ------------------------------------------
+# 給 index.html 在載入時呼叫一次：決定要不要整頁擋下顯示維護畫面、
+# 要不要顯示跑馬燈、每個功能圖示要不要顯示「Beta／維護中」標籤。
+# 這裡是唯讀查詢，實際的開關/編輯都在中控台（admin-panel）那邊操作。
+# ==========================================
+@router.get("/api/dashboard-settings")
+def api_dashboard_settings():
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT `key`, `value` FROM bot_settings WHERE `key` IN "
+                "('dashboard_enabled', 'marquee_enabled', 'marquee_text')"
+            )
+            settings = {r["key"]: r["value"] for r in cur.fetchall()}
+
+            cur.execute("SELECT feature_key, status FROM feature_switches")
+            feature_statuses = {r["feature_key"]: r["status"] for r in cur.fetchall()}
+
+        return {
+            "dashboard_enabled": settings.get("dashboard_enabled", "1") == "1",
+            "marquee_enabled": settings.get("marquee_enabled", "0") == "1",
+            "marquee_text": settings.get("marquee_text") or "",
+            "feature_statuses": feature_statuses,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
