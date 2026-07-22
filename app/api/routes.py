@@ -5,6 +5,7 @@ main.py 用 app.include_router(router) 掛載即可。
 """
 from datetime import datetime
 from typing import Literal, Optional
+from dateutil.relativedelta import relativedelta
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -40,10 +41,11 @@ def api_list_expenses(
     start: Optional[str] = None,
     end: Optional[str] = None,
     record_type: Optional[str] = None,
+    payment_method: Optional[str] = None,
 ):
-    """個人/群組首頁流水帳、進階查詢共用：依日期區間、收支類型篩選"""
+    """個人/群組首頁流水帳、進階查詢共用：依日期區間、收支類型、支付方式篩選"""
     _require_db()
-    sql = "SELECT id, record_type, amount, item, category, created_by_name, created_at FROM expenses WHERE owner_type=%s AND owner_id=%s"
+    sql = "SELECT id, record_type, amount, item, category, payment_method, created_by_name, created_at FROM expenses WHERE owner_type=%s AND owner_id=%s"
     params = [owner_type, owner_id]
     if start:
         sql += " AND created_at >= %s"
@@ -54,6 +56,9 @@ def api_list_expenses(
     if record_type and record_type != "all":
         sql += " AND record_type = %s"
         params.append(record_type)
+    if payment_method and payment_method != "all":
+        sql += " AND payment_method = %s"
+        params.append(payment_method)
     sql += " ORDER BY created_at DESC"
     try:
         with db_cursor() as cur:
@@ -62,6 +67,26 @@ def api_list_expenses(
         for r in rows:
             r["created_at"] = r["created_at"].isoformat()
         return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/api/payment-method-summary")
+def api_payment_method_summary(owner_id: str, start: Optional[str] = None, end: Optional[str] = None):
+    """個人版限定：依支付方式加總支出金額，供首頁圖表與「現金/最常用支付工具」欄位使用"""
+    _require_db()
+    sql = "SELECT payment_method, COALESCE(SUM(amount),0) AS total FROM expenses WHERE owner_type='user' AND owner_id=%s AND record_type='expense'"
+    params = [owner_id]
+    if start:
+        sql += " AND created_at >= %s"
+        params.append(f"{start} 00:00:00")
+    if end:
+        sql += " AND created_at <= %s"
+        params.append(f"{end} 23:59:59")
+    sql += " GROUP BY payment_method ORDER BY total DESC"
+    try:
+        with db_cursor() as cur:
+            cur.execute(sql, tuple(params))
+            return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -401,6 +426,249 @@ def api_delete_trip_item(item_id: int):
     try:
         with db_cursor() as cur:
             cur.execute("DELETE FROM itineraries WHERE id=%s", (item_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 💳 繳費功能 REST API（個人版限定）
+# ==========================================
+class BillCreate(BaseModel):
+    bill_name: str
+    amount: int
+    due_date: str  # "YYYY-MM-DD"
+    installments_remaining: Optional[int] = None
+
+class BillUpdate(BaseModel):
+    bill_name: str
+    amount: int
+    due_date: str
+    installments_remaining: Optional[int] = None
+
+@router.get("/api/bills")
+def api_list_bills(owner_id: str):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT id, bill_name, amount, due_date, installments_remaining, status, is_paid, created_at
+                   FROM bills WHERE owner_id=%s ORDER BY due_date ASC""",
+                (owner_id,)
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                r["due_date"] = r["due_date"].isoformat()
+                r["created_at"] = r["created_at"].isoformat()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/bills")
+def api_create_bill(owner_id: str, body: BillCreate):
+    _require_db()
+    due = _parse_dt(body.due_date + " 00:00").date()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """INSERT INTO bills (owner_id, bill_name, amount, due_date, installments_remaining)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (owner_id, body.bill_name.strip(), body.amount, due, body.installments_remaining)
+            )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.patch("/api/bills/{bill_id}")
+def api_update_bill(bill_id: int, body: BillUpdate):
+    _require_db()
+    due = _parse_dt(body.due_date + " 00:00").date()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """UPDATE bills SET bill_name=%s, amount=%s, due_date=%s, installments_remaining=%s
+                   WHERE id=%s""",
+                (body.bill_name.strip(), body.amount, due, body.installments_remaining, bill_id)
+            )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/api/bills/{bill_id}")
+def api_delete_bill(bill_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM bills WHERE id=%s", (bill_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/api/bill-payments")
+def api_list_bill_payments(owner_id: str):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT bp.id, bp.bill_id, b.bill_name, bp.amount, bp.paid_at
+                   FROM bill_payments bp JOIN bills b ON b.id = bp.bill_id
+                   WHERE bp.owner_id=%s ORDER BY bp.paid_at DESC""",
+                (owner_id,)
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                r["paid_at"] = r["paid_at"].isoformat()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/api/bill-payments/{payment_id}")
+def api_delete_bill_payment(payment_id: int):
+    """刪除一筆核銷紀錄：把對應帳單的已繳狀態改回未繳，並還原到繳費前的到期日/期數
+    （若該筆核銷曾同時寫入一筆一般支出，一併刪除該支出，避免帳目對不起來）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT bill_id, expense_id FROM bill_payments WHERE id=%s", (payment_id,))
+            payment = cur.fetchone()
+            if not payment:
+                raise HTTPException(status_code=404, detail="找不到此核銷紀錄")
+
+            cur.execute("SELECT status, due_date, installments_remaining FROM bills WHERE id=%s", (payment["bill_id"],))
+            bill = cur.fetchone()
+            if bill:
+                if bill["status"] == "completed":
+                    # 是最後一期才核銷完成的：期數補回1、狀態改回active，到期日當初沒被更動過不用還原
+                    cur.execute(
+                        "UPDATE bills SET is_paid=0, status='active', installments_remaining=1 WHERE id=%s",
+                        (payment["bill_id"],)
+                    )
+                else:
+                    new_installments = (bill["installments_remaining"] + 1) if bill["installments_remaining"] is not None else None
+                    reverted_due = bill["due_date"] - relativedelta(months=1)
+                    cur.execute(
+                        "UPDATE bills SET is_paid=0, due_date=%s, installments_remaining=%s WHERE id=%s",
+                        (reverted_due, new_installments, payment["bill_id"])
+                    )
+
+            if payment["expense_id"]:
+                cur.execute("DELETE FROM expenses WHERE id=%s", (payment["expense_id"],))
+
+            cur.execute("DELETE FROM bill_payments WHERE id=%s", (payment_id,))
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# 🐷 存錢功能 REST API（個人版限定）
+# ==========================================
+class SavingsJarCreate(BaseModel):
+    jar_name: str
+    target_amount: Optional[int] = None
+
+class SavingsJarUpdate(BaseModel):
+    jar_name: str
+    balance: int
+    target_amount: Optional[int] = None
+
+@router.get("/api/savings-jars")
+def api_list_jars(owner_id: str):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, jar_name, balance, target_amount, created_at FROM savings_jars WHERE owner_id=%s ORDER BY created_at ASC",
+                (owner_id,)
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                r["created_at"] = r["created_at"].isoformat()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/savings-jars")
+def api_create_jar(owner_id: str, body: SavingsJarCreate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM savings_jars WHERE owner_id=%s", (owner_id,))
+            if cur.fetchone()["cnt"] >= 6:
+                raise HTTPException(status_code=400, detail="每人最多只能建立 6 個存錢筒")
+            cur.execute(
+                "INSERT INTO savings_jars (owner_id, jar_name, target_amount) VALUES (%s, %s, %s)",
+                (owner_id, body.jar_name.strip(), body.target_amount)
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.patch("/api/savings-jars/{jar_id}")
+def api_update_jar(jar_id: int, body: SavingsJarUpdate):
+    """可直接修正餘額（例如手動調整誤差），也可改名稱／目標金額"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "UPDATE savings_jars SET jar_name=%s, balance=%s, target_amount=%s WHERE id=%s",
+                (body.jar_name.strip(), body.balance, body.target_amount, jar_id)
+            )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/api/savings-jars/{jar_id}")
+def api_delete_jar(jar_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM savings_jars WHERE id=%s", (jar_id,))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# 💰 支付方式 REST API（個人版限定）
+# ==========================================
+class PaymentMethodCreate(BaseModel):
+    method_name: str
+
+@router.get("/api/payment-methods")
+def api_list_payment_methods(owner_id: str):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT id, method_name FROM payment_methods WHERE owner_id=%s ORDER BY created_at ASC", (owner_id,))
+        return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/payment-methods")
+def api_create_payment_method(owner_id: str, body: PaymentMethodCreate):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "INSERT INTO payment_methods (owner_id, method_name) VALUES (%s, %s)",
+                (owner_id, body.method_name.strip())
+            )
+        return {"ok": True}
+    except Exception as e:
+        if "Duplicate" in str(e):
+            raise HTTPException(status_code=400, detail="這個支付方式已經登記過了")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/api/payment-methods/{method_id}")
+def api_delete_payment_method(method_id: int):
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM payment_methods WHERE id=%s", (method_id,))
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -34,6 +34,9 @@ from app.features.test_mode import try_handle_test_mode_gate, is_test_mode_activ
 from app.features.itinerary import try_handle_trip_flow, try_handle_itinerary_confirm_reply, itinerary_reminder_loop
 from app.features.group_split import try_handle_group_split_reply, try_start_group_split_question
 from app.features.receipt import try_handle_receipt_naming_reply, try_handle_edit_order_item, handle_receipt_image
+from app.features.bills import try_add_bill, try_list_bills, try_reconcile_bill, bill_reminder_loop
+from app.features.savings import try_add_jar, try_save_money, try_list_jars
+from app.payment_method import try_extract_payment_method
 
 from app.api.routes import router as api_router
 
@@ -159,6 +162,23 @@ def handle_text_message(event):
 
     if is_group and try_handle_group_split_reply(target_id, event, _gate_text, creator_id, reply_token):
         return
+
+    # ====================================================
+    # 💳🐷 【個人版限定：繳費功能／存錢功能指令】
+    # ====================================================
+    if not is_group:
+        if is_test_mode_active("user", target_id, "bill_payment"):
+            if try_add_bill(target_id, _gate_text, reply_token):
+                return
+            if try_list_bills(target_id, _gate_text, reply_token):
+                return
+        if is_test_mode_active("user", target_id, "savings"):
+            if try_add_jar(target_id, _gate_text, reply_token):
+                return
+            if try_save_money(target_id, _gate_text, reply_token):
+                return
+            if try_list_jars(target_id, _gate_text, reply_token):
+                return
 
     # ====================================================
     # 🎯 🛠️ 【核銷解鎖與防呆邏輯】
@@ -356,6 +376,28 @@ def handle_text_message(event):
     is_income_quick = bool(income_prefix_match)
     text_for_fast_match = income_prefix_match.group(1) if income_prefix_match else clean_text
 
+    # 💳 個人版限定：支付方式偵測（固定格式「項目 金額 支付方式」）
+    payment_method = "現金"
+    if not is_group and current_mode == "normal" and not is_income_quick and is_test_mode_active("user", target_id, "payment_method"):
+        extracted = try_extract_payment_method(text_for_fast_match, target_id)
+        if extracted:
+            ext_item_name, ext_amount, ext_method = extracted
+            creator_name_str = resolve_id_to_name(target_id, creator_id)
+            category = resolve_category(ext_item_name, ai_client)
+            try:
+                with db_cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO expenses
+                           (owner_type, owner_id, record_type, amount, item, category, payment_method, created_by_uid, created_by_name)
+                           VALUES ('user', %s, 'expense', %s, %s, %s, %s, %s, %s)""",
+                        (target_id, ext_amount, ext_item_name, category, ext_method, creator_id, creator_name_str)
+                    )
+                send_line_reply(reply_token, f"✅ 已紀錄：{ext_item_name} ${ext_amount}（分類：{category}｜支付：{ext_method}）")
+            except Exception as e:
+                log_error("記帳寫入(支付方式)", e, target_id)
+                send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
+            return
+
     fast_match = re.fullmatch(r'^(.+?)\s*(\d+)\s*(?:元|塊)?$', text_for_fast_match)
     if fast_match and current_mode in ["normal", "order"]:
         raw_item_name = fast_match.group(1).strip()
@@ -374,14 +416,19 @@ def handle_text_message(event):
                     if try_start_group_split_question(target_id, item_name, amount, creator_id, creator_name_str, reply_token):
                         return
 
+                # 💳 個人版限定：繳費功能開通時，先比對是否為未繳費帳單的核銷
+                if not is_group and record_type == "expense" and is_test_mode_active("user", target_id, "bill_payment"):
+                    if try_reconcile_bill(target_id, item_name, amount, reply_token):
+                        return
+
                 category = resolve_category(item_name, ai_client) if record_type == "expense" else "收入"
                 try:
                     with db_cursor() as cur:
                         cur.execute(
                             """INSERT INTO expenses
-                               (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                            (owner_type, target_id, record_type, amount, item_name, category, creator_id, creator_name_str)
+                               (owner_type, owner_id, record_type, amount, item, category, payment_method, created_by_uid, created_by_name)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                            (owner_type, target_id, record_type, amount, item_name, category, payment_method, creator_id, creator_name_str)
                         )
                     if is_income_quick:
                         send_line_reply(reply_token, f"💰 已紀錄收入：{item_name} ${amount}")
@@ -560,8 +607,9 @@ def handle_image_message(event):
 
 @app.on_event("startup")
 async def start_background_scheduler():
-    """🗓️ 行程模式提醒推播的背景排程，每 60 秒檢查一次是否有即將開始的行程"""
+    """🗓️ 行程模式提醒推播（每60秒檢查）、💳 繳費提醒推播（每天檢查一次）"""
     asyncio.create_task(itinerary_reminder_loop())
+    asyncio.create_task(bill_reminder_loop())
 
 @app.get("/")
 def health_check(): 

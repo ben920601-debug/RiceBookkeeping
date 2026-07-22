@@ -7,7 +7,7 @@ from app.logging_utils import log_error
 
 EXPENSE_CATEGORIES = [
     "餐飲", "交通", "購物", "娛樂消遣", "居家生活",
-    "醫療保健", "日用品", "水電通訊", "教育學習", "保險", "人情社交", "其他",
+    "醫療保健", "日用品", "水電通訊", "教育學習", "保險", "人情社交", "儲蓄", "其他",
 ]
 
 CATEGORY_KEYWORDS = {
