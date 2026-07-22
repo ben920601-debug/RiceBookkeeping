@@ -435,6 +435,7 @@ def handle_text_message(event):
                         send_line_reply(reply_token, f"💰 已紀錄收入：{item_name} ${amount}")
                     else:
                         send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}（分類：{category}）")
+                    log_stat_event("python_reply", target_id)
                 except Exception as e:
                     log_error("記帳寫入", e, target_id)
                     send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
@@ -455,6 +456,7 @@ def handle_text_message(event):
                             (target_id, active_code, actual_buyer_id, actual_buyer_name, item_name, amount)
                         )
                     send_line_reply(reply_token, f"📝 已接單：{item_name} ${amount}")
+                    log_stat_event("python_reply", target_id)
                 except Exception as e:
                     log_error("團購品項寫入", e, target_id)
                     send_line_reply(reply_token, "⚠️ 接單失敗，請稍後再試一次。")
@@ -481,6 +483,7 @@ def handle_text_message(event):
             model='gemini-2.5-flash', contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=SuperRouter, temperature=0.3),
         ).parsed
+        log_stat_event("gemini_reply", target_id)
 
         # 1. AI 萃取記帳與陪聊
         if result.intent == "record":

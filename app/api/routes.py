@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.db import db_cursor, is_db_ready
 from app.geo import geocode_location
+from app.logging_utils import log_error
 
 router = APIRouter()
 
@@ -684,22 +685,36 @@ def api_delete_payment_method(method_id: int):
 @router.get("/api/dashboard-settings")
 def api_dashboard_settings():
     _require_db()
+
+    # 兩段查詢刻意分開包 try/except：任一段失敗（例如 feature_switches 這張表
+    # 還沒跑 migration）都不該連累另一段，尤其 dashboard_enabled 這種「總開關」
+    # 絕對不能因為別的表出錯就整支 API 失敗、被前端誤判成「讀不到＝當作開放」。
+    settings = {}
     try:
         with db_cursor() as cur:
             cur.execute(
                 "SELECT `key`, `value` FROM bot_settings WHERE `key` IN "
-                "('dashboard_enabled', 'marquee_enabled', 'marquee_text')"
+                "('dashboard_enabled', 'marquee_enabled', 'marquee_text', 'marquee_color', 'marquee_speed_seconds')"
             )
             settings = {r["key"]: r["value"] for r in cur.fetchall()}
+    except Exception as e:
+        log_error("dashboard-settings讀取(bot_settings)", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
+    feature_statuses = {}
+    try:
+        with db_cursor() as cur:
             cur.execute("SELECT feature_key, status FROM feature_switches")
             feature_statuses = {r["feature_key"]: r["status"] for r in cur.fetchall()}
-
-        return {
-            "dashboard_enabled": settings.get("dashboard_enabled", "1") == "1",
-            "marquee_enabled": settings.get("marquee_enabled", "0") == "1",
-            "marquee_text": settings.get("marquee_text") or "",
-            "feature_statuses": feature_statuses,
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log_error("dashboard-settings讀取(feature_switches)", e)
+        # feature_statuses 查不到就給空字典，不影響 dashboard_enabled／跑馬燈這些核心設定
+
+    return {
+        "dashboard_enabled": settings.get("dashboard_enabled", "1") == "1",
+        "marquee_enabled": settings.get("marquee_enabled", "0") == "1",
+        "marquee_text": settings.get("marquee_text") or "",
+        "marquee_color": settings.get("marquee_color") or "#F59E0B",
+        "marquee_speed_seconds": int(settings.get("marquee_speed_seconds") or 18),
+        "feature_statuses": feature_statuses,
+    }
