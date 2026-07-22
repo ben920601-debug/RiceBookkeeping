@@ -1,8 +1,9 @@
 """
-測試限定功能（旅行模式／群組團單／收據辨識）的密碼驗證與單一模式互斥機制。
+測試限定功能（旅行模式／收據辨識）的密碼驗證與單一模式互斥機制。
+（群組團單分攤已於 V1.7 下放為群組主要功能，不再需要密碼開通，因此不在這份清單裡。）
 
 同一時間同一個 owner（個人或群組）只能有一個模式是開啟的，避免多個模式
-同時監聽訊息造成資料輸入互相干擾。這個模組是三個功能模組共用的「守門員」，
+同時監聽訊息造成資料輸入互相干擾。這個模組是這幾個功能模組共用的「守門員」，
 只直接操作它們的暫存狀態表（trip_sessions / pending_group_expense /
 pending_receipt_naming），不 import 那幾個模組本身，避免循環依賴。
 """
@@ -16,7 +17,6 @@ from app.line_client import send_line_reply
 
 TEST_FEATURE_KEYWORDS = {
     "旅行模式": "itinerary",
-    "群組團單": "group_split",
     "收據辨識": "receipt_ocr",
 }
 TEST_FEATURE_LABELS = {v: k for k, v in TEST_FEATURE_KEYWORDS.items()}

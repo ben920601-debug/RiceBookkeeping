@@ -18,7 +18,7 @@ DEFAULT_KEYWORD_REPLIES = {
 }
 
 CACHE_TTL = 5  # 秒
-_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": [], "maintenance_message": "", "ai_persona": ""}
+_cache = {"ts": 0, "bot_enabled": True, "keyword_replies": {}, "sensitive_words": [], "sensitive_words_detail": [], "maintenance_message": "", "ai_persona": ""}
 
 DEFAULT_MAINTENANCE_MESSAGE = "🤖 系統維護中，請稍後再試。"
 DEFAULT_AI_PERSONA = "你是一個親切、幽默的記帳助理「記帳米粒」。"
@@ -66,8 +66,10 @@ def _refresh_cache_if_stale():
             cur.execute("SELECT keyword, reply_text FROM keyword_replies WHERE enabled=1")
             _cache["keyword_replies"] = {r["keyword"]: r["reply_text"] for r in cur.fetchall()}
 
-            cur.execute("SELECT word FROM sensitive_words")
-            _cache["sensitive_words"] = [r["word"] for r in cur.fetchall()]
+            cur.execute("SELECT word, description FROM sensitive_words")
+            rows = cur.fetchall()
+            _cache["sensitive_words"] = [r["word"] for r in rows]
+            _cache["sensitive_words_detail"] = [{"word": r["word"], "description": r["description"] or ""} for r in rows]
 
             _cache["ts"] = time.time()
     except Exception as e:
@@ -87,6 +89,13 @@ def get_keyword_replies() -> dict:
 def get_sensitive_words() -> list:
     _refresh_cache_if_stale()
     return _cache["sensitive_words"]
+
+
+def get_sensitive_words_detail() -> list:
+    """回傳 [{"word":..., "description":...}, ...]，description 是中控後台填的語意/情境說明，
+    供 AI 語意判斷敏感詞是否命中使用（不是單純文字比對）"""
+    _refresh_cache_if_stale()
+    return _cache["sensitive_words_detail"]
 
 
 def get_maintenance_message() -> str:

@@ -25,8 +25,10 @@ from google.genai import types
 from app.config import MY_LIFF_ID
 from app.db import db_cursor, is_db_ready
 from app.logging_utils import log_error, log_stat_event
-from app.cache import is_bot_enabled, get_keyword_replies, get_sensitive_words, get_maintenance_message, get_ai_persona
+from app.cache import is_bot_enabled, get_keyword_replies, get_maintenance_message, get_ai_persona
+from app.moderation import check_sensitive_content
 from app.line_client import line_handler, ai_client, send_line_reply, resolve_id_to_name, get_real_mentions
+from app.categorize import resolve_category, EXPENSE_CATEGORIES
 
 from app.features.test_mode import try_handle_test_mode_gate, is_test_mode_active
 from app.features.itinerary import try_handle_trip_flow, try_handle_itinerary_confirm_reply, itinerary_reminder_loop
@@ -52,7 +54,7 @@ class SingleRecord(BaseModel):
     record_type: Literal["expense", "income"] = Field(default="expense")
     amount: int = Field(default=0)
     item: str = Field(default="")
-    category: str = Field(default="生活雜費")
+    category: str = Field(default="其他")
 
 class SingleSettlement(BaseModel):
     payer_name: str = Field(default="")
@@ -128,10 +130,10 @@ def handle_text_message(event):
             log_error("群組狀態查詢", e, target_id)
             return
 
-    is_bot_tagged = False
-    mention = getattr(event.message, "mention", None)
-    if mention and mention.mentionees: is_bot_tagged = True
-    if any(kw in user_text for kw in ["@記帳米粒", "記帳米粒"]): is_bot_tagged = True
+    # 🐛 修正：只有訊息文字裡實際出現「記帳米粒」字樣才算被tag，
+    # 不能只看「這則訊息裡有沒有任何@tag」——之前的寫法會導致tag群組裡任何其他成員
+    # 都被誤判成「機器人被叫到」，讓機器人對每一次@tag都跟著回覆。
+    is_bot_tagged = any(kw in user_text for kw in ["@記帳米粒", "記帳米粒"])
     if is_group and not is_bot_tagged: return 
 
     # ====================================================
@@ -334,11 +336,12 @@ def handle_text_message(event):
         send_line_reply(reply_token, instructions)
         return
 
-    for kw in get_sensitive_words():
-        if kw in clean_text:
-            log_stat_event("sensitive_block", target_id)
-            send_line_reply(reply_token, "🤖 米粒為純財務助理，請勿探討敏感議題喔！")
-            return
+    is_sensitive, matched_word = check_sensitive_content(ai_client, clean_text)
+    if is_sensitive:
+        log_stat_event("sensitive_block", target_id)
+        log_error("敏感詞觸發", f"命中：{matched_word}｜原文：{clean_text[:100]}", target_id)
+        send_line_reply(reply_token, "🤖 米粒為純財務助理，請勿探討敏感議題喔！")
+        return
 
     # ====================================================
     # ⚡ 🚀 【Python 第一層極速攔截：代點單與記帳直通落庫】
@@ -365,24 +368,25 @@ def handle_text_message(event):
                 creator_name_str = resolve_id_to_name(target_id, creator_id)
                 record_type = "income" if is_income_quick else "expense"
 
-                # 🍱 測試限定：群組團單分攤 —— 群組、支出（非收入）、且該群組已開通測試模式時，
-                # 改為詢問「均分／@tag／跳過」，而不是直接寫入一般記帳
-                if is_group and not is_income_quick and is_test_mode_active("group", target_id, "group_split"):
+                # 🍱 群組團單分攤（V1.7 起為群組主要功能，不再需要測試模式開通）
+                # 群組、支出（非收入）時，改為詢問「均分／@tag／跳過」，而不是直接寫入一般記帳
+                if is_group and not is_income_quick:
                     if try_start_group_split_question(target_id, item_name, amount, creator_id, creator_name_str, reply_token):
                         return
 
+                category = resolve_category(item_name, ai_client) if record_type == "expense" else "收入"
                 try:
                     with db_cursor() as cur:
                         cur.execute(
                             """INSERT INTO expenses
                                (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
-                               VALUES (%s, %s, %s, %s, %s, '生活雜費', %s, %s)""",
-                            (owner_type, target_id, record_type, amount, item_name, creator_id, creator_name_str)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                            (owner_type, target_id, record_type, amount, item_name, category, creator_id, creator_name_str)
                         )
                     if is_income_quick:
                         send_line_reply(reply_token, f"💰 已紀錄收入：{item_name} ${amount}")
                     else:
-                        send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}")
+                        send_line_reply(reply_token, f"✅ 已紀錄：{item_name} ${amount}（分類：{category}）")
                 except Exception as e:
                     log_error("記帳寫入", e, target_id)
                     send_line_reply(reply_token, "⚠️ 紀錄失敗，請稍後再試一次。")
@@ -418,7 +422,9 @@ def handle_text_message(event):
         
         【分流任務】：
         1. 判定 intent (record, order_start, order_end, order_item, chat)。
-        2. 如果對話中包含「花費與金額」（例如：今天買咖啡花了150元），請提取出紀錄 (intent="record")，並在 ai_reply 中給予親切的聊天回覆。
+        2. 如果對話中包含「花費與金額」（例如：今天買咖啡花了150元），請提取出紀錄 (intent="record")，
+           category 欄位請從以下分類中選一個最符合的：{"、".join(EXPENSE_CATEGORIES)}；
+           並在 ai_reply 中給予親切的聊天回覆。
         3. 如果是純閒聊，intent="chat"，請在 ai_reply 陪使用者自然對話。
         4. 開團(order_start) 或 結單(order_end) 等控制指令，請在 ai_reply 給予親切的確認回覆。
         """
@@ -437,11 +443,12 @@ def handle_text_message(event):
                     with db_cursor() as cur:
                         for rec in result.records:
                             if rec.amount > 0:
+                                final_category = rec.category if rec.category in EXPENSE_CATEGORIES else resolve_category(rec.item)
                                 cur.execute(
                                     """INSERT INTO expenses
                                        (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                                    (owner_type, target_id, rec.record_type, rec.amount, rec.item, rec.category, creator_id, creator_name_str)
+                                    (owner_type, target_id, rec.record_type, rec.amount, rec.item, final_category, creator_id, creator_name_str)
                                 )
                 except Exception as e:
                     log_error("AI記帳寫入", e, target_id)

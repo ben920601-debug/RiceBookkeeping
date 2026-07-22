@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from app.db import db_cursor
 from app.logging_utils import log_error
 from app.line_client import send_line_reply, get_mentions_with_amounts, resolve_id_to_name
+from app.categorize import resolve_category
 
 def get_group_member_list(group_id: str) -> list:
     """取得目前快取到的群組成員清單（可能不完整，僅限機器人曾經互動過的成員）"""
@@ -105,8 +106,8 @@ def try_handle_group_split_reply(group_id: str, event, clean_text: str, creator_
                     cur.execute(
                         """INSERT INTO expenses
                            (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
-                           VALUES ('group', %s, 'expense', %s, %s, '生活雜費', %s, %s)""",
-                        (group_id, i["price"], i["item_name"], payer_id, payer_name)
+                           VALUES ('group', %s, 'expense', %s, %s, %s, %s, %s)""",
+                        (group_id, i["price"], i["item_name"], resolve_category(i["item_name"]), payer_id, payer_name)
                     )
             send_line_reply(reply_token, f"✅ 已記為一般花費（不分攤）：共 ${row['total_amount']}")
         except Exception as e:

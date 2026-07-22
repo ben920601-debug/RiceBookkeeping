@@ -15,6 +15,7 @@ from typing import List
 from app.db import db_cursor
 from app.logging_utils import log_error
 from app.line_client import send_line_reply, ai_client, download_line_image
+from app.categorize import resolve_category
 from google.genai import types
 
 class ReceiptItemModel(BaseModel):
@@ -113,8 +114,8 @@ def handle_receipt_image(owner_type: str, owner_id: str, is_group: bool, creator
                     cur.execute(
                         """INSERT INTO expenses
                            (owner_type, owner_id, record_type, amount, item, category, created_by_uid, created_by_name)
-                           VALUES ('user', %s, 'expense', %s, %s, '生活雜費', %s, %s)""",
-                        (owner_id, i["price"], i["item_name"], creator_id, creator_name)
+                           VALUES ('user', %s, 'expense', %s, %s, %s, %s, %s)""",
+                        (owner_id, i["price"], i["item_name"], resolve_category(i["item_name"], ai_client), creator_id, creator_name)
                     )
             send_line_reply(reply_token, f"🧾 收據辨識完成，已記入個人帳本：\n{item_lines}\n💰 合計：${total}")
         except Exception as e:
