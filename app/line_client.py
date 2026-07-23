@@ -173,3 +173,46 @@ def download_line_image(message_id: str) -> bytes:
     res = httpx.get(url, headers=headers, timeout=15.0, verify=certifi.where())
     res.raise_for_status()
     return res.content
+
+
+def fetch_all_group_member_ids(group_id: str) -> list:
+    """呼叫 LINE 官方「取得群組成員ID清單」API，拿到群組『真正的』全體成員，
+    不受限於機器人有沒有跟對方互動過。部分帳號類型/權限可能無法使用這支 API
+    （會回傳 403），呼叫端應該要有 fallback（退回原本的互動快取名單）。
+    有分頁（continuationToken）就自動翻頁抓完。"""
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    url = f"https://api.line.me/v2/bot/group/{group_id}/members/ids"
+    all_ids = []
+    params = {}
+    try:
+        while True:
+            res = httpx.get(url, headers=headers, params=params, timeout=8.0, verify=certifi.where())
+            if res.status_code != 200:
+                log_error("群組成員清單API", f"status={res.status_code} body={res.text[:200]}", group_id)
+                break
+            data = res.json()
+            all_ids.extend(data.get("memberIds", []))
+            next_token = data.get("next")
+            if not next_token:
+                break
+            params = {"start": next_token}
+    except Exception as e:
+        log_error("群組成員清單API", e, group_id)
+    return all_ids
+
+
+def get_full_group_member_list(group_id: str) -> list:
+    """回傳 [{"user_id":..., "display_name":...}, ...]，優先用 LINE 官方 API 抓『真正的』
+    群組全體成員（含從未跟機器人互動過的人），並順便把暱稱寫回快取表；
+    如果 API 打不通（權限不足等），退回原本的互動快取名單，確保功能不會直接掛掉。"""
+    member_ids = fetch_all_group_member_ids(group_id)
+    if not member_ids:
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT user_id, display_name FROM group_members WHERE group_id=%s", (group_id,))
+                return cur.fetchall()
+        except Exception as e:
+            log_error("群組成員快取查詢(fallback)", e, group_id)
+            return []
+
+    return [{"user_id": uid, "display_name": resolve_id_to_name(group_id, uid)} for uid in member_ids]

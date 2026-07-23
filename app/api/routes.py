@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from app.db import db_cursor, is_db_ready
 from app.geo import geocode_location
 from app.logging_utils import log_error
+from app.line_client import get_full_group_member_list
 
 router = APIRouter()
 
@@ -25,9 +26,20 @@ class GroupStateUpdate(BaseModel):
     state: Literal["normal", "order", "settle"]
 
 class OrderItemUpdate(BaseModel):
+    buyer_id: str
     buyer_name: str
     item_name: str
     price: int
+
+class OrderItemCreate(BaseModel):
+    buyer_id: str
+    buyer_name: str
+    item_name: str
+    price: int
+
+class OrderMasterPayerUpdate(BaseModel):
+    master_payer_id: str
+    master_payer_name: str
 
 
 def _require_db():
@@ -170,7 +182,7 @@ def api_list_orders(group_id: str):
     try:
         with db_cursor() as cur:
             cur.execute(
-                """SELECT id, order_code, order_name, order_date, total_amount, master_payer_name, created_at
+                """SELECT id, order_code, order_name, order_date, total_amount, master_payer_id, master_payer_name, created_at
                    FROM orders WHERE group_id=%s ORDER BY created_at DESC""",
                 (group_id,)
             )
@@ -184,7 +196,7 @@ def api_list_orders(group_id: str):
 
             for o in orders:
                 cur.execute(
-                    "SELECT id, buyer_name, item_name, price FROM order_items WHERE order_id=%s ORDER BY id ASC",
+                    "SELECT id, buyer_id, buyer_name, item_name, price FROM order_items WHERE order_id=%s ORDER BY id ASC",
                     (o["id"],)
                 )
                 o["items"] = cur.fetchall()
@@ -209,6 +221,8 @@ def api_list_orders(group_id: str):
 
 @router.patch("/api/order-items/{item_id}")
 def api_update_order_item(item_id: int, body: OrderItemUpdate):
+    """修改團單品項：務必連 buyer_id 一起改，因為 LINE 對話端的核銷比對是用 buyer_id
+    去查應付金額，只改 buyer_name（純文字）的話，核銷永遠對不上正確的人。"""
     _require_db()
     try:
         with db_cursor() as cur:
@@ -217,8 +231,8 @@ def api_update_order_item(item_id: int, body: OrderItemUpdate):
             if not row:
                 raise HTTPException(status_code=404, detail="找不到此品項")
             cur.execute(
-                "UPDATE order_items SET buyer_name=%s, item_name=%s, price=%s WHERE id=%s",
-                (body.buyer_name, body.item_name, body.price, item_id)
+                "UPDATE order_items SET buyer_id=%s, buyer_name=%s, item_name=%s, price=%s WHERE id=%s",
+                (body.buyer_id, body.buyer_name, body.item_name, body.price, item_id)
             )
             if row["order_id"]:
                 cur.execute(
@@ -262,6 +276,62 @@ def api_delete_order(group_id: str, order_id: int):
             cur.execute("DELETE FROM order_items WHERE order_id=%s AND group_id=%s", (order_id, group_id))
             cur.execute("DELETE FROM orders WHERE id=%s AND group_id=%s", (order_id, group_id))
         return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/groups/{group_id}/members")
+def api_list_group_members(group_id: str):
+    """群組完整成員清單（優先呼叫LINE官方API拿真實全體成員），供監控後台下拉選單使用，
+    確保選到的是正確的 user_id，不會因為手動輸入名字打錯字而讓核銷對不上人。"""
+    try:
+        return get_full_group_member_list(group_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/groups/{group_id}/orders/{order_id}/items")
+def api_add_order_item(group_id: str, order_id: int, body: OrderItemCreate):
+    """幫團單新增一位付款人（分攤品項）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT order_code FROM orders WHERE id=%s AND group_id=%s", (order_id, group_id))
+            order = cur.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="找不到此團單")
+            cur.execute(
+                """INSERT INTO order_items (group_id, order_code, order_id, buyer_id, buyer_name, item_name, price)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (group_id, order["order_code"], order_id, body.buyer_id, body.buyer_name, body.item_name, body.price)
+            )
+            cur.execute(
+                "UPDATE orders SET total_amount=(SELECT COALESCE(SUM(price),0) FROM order_items WHERE order_id=%s) WHERE id=%s",
+                (order_id, order_id)
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/api/groups/{group_id}/orders/{order_id}")
+def api_update_order_master_payer(group_id: str, order_id: int, body: OrderMasterPayerUpdate):
+    """修改團單的墊付人（誰先代墊了這筆錢）"""
+    _require_db()
+    try:
+        with db_cursor() as cur:
+            cur.execute("SELECT id FROM orders WHERE id=%s AND group_id=%s", (order_id, group_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="找不到此團單")
+            cur.execute(
+                "UPDATE orders SET master_payer_id=%s, master_payer_name=%s WHERE id=%s",
+                (body.master_payer_id, body.master_payer_name, order_id)
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -9,18 +9,13 @@ from datetime import datetime, timedelta
 
 from app.db import db_cursor
 from app.logging_utils import log_error
-from app.line_client import send_line_reply, get_mentions_with_amounts, resolve_id_to_name
+from app.line_client import send_line_reply, get_mentions_with_amounts, resolve_id_to_name, get_full_group_member_list
 from app.categorize import resolve_category
 
 def get_group_member_list(group_id: str) -> list:
-    """取得目前快取到的群組成員清單（可能不完整，僅限機器人曾經互動過的成員）"""
-    try:
-        with db_cursor() as cur:
-            cur.execute("SELECT user_id, display_name FROM group_members WHERE group_id=%s", (group_id,))
-            return cur.fetchall()
-    except Exception as e:
-        log_error("群組成員查詢", e, group_id)
-        return []
+    """取得群組完整成員清單（優先呼叫LINE官方API拿真實全體成員，
+    非僅限機器人互動過的人；API打不通則自動退回互動快取名單）"""
+    return get_full_group_member_list(group_id)
 
 def create_split_order(group_id: str, payer_id: str, payer_name: str, items: list, participants: list) -> str:
     """
