@@ -32,7 +32,7 @@ from app.categorize import resolve_category, EXPENSE_CATEGORIES
 
 from app.features.test_mode import try_handle_test_mode_gate, is_test_mode_active
 from app.features.itinerary import try_handle_trip_flow, try_handle_itinerary_confirm_reply, itinerary_reminder_loop
-from app.features.group_split import try_handle_group_split_reply, try_start_group_split_question
+from app.features.group_split import try_handle_group_split_reply, try_start_group_split_question, try_handle_fetch_members_command
 from app.features.receipt import try_handle_receipt_naming_reply, try_handle_edit_order_item, handle_receipt_image
 from app.features.bills import try_add_bill, try_list_bills, try_reconcile_bill, bill_reminder_loop
 from app.features.savings import try_add_jar, try_save_money, try_list_jars
@@ -162,6 +162,9 @@ def handle_text_message(event):
         return
 
     if is_group and try_handle_group_split_reply(target_id, event, _gate_text, creator_id, reply_token):
+        return
+
+    if is_group and try_handle_fetch_members_command(target_id, event, _gate_text, reply_token):
         return
 
     # ====================================================

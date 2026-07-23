@@ -9,13 +9,56 @@ from datetime import datetime, timedelta
 
 from app.db import db_cursor
 from app.logging_utils import log_error
-from app.line_client import send_line_reply, get_mentions_with_amounts, resolve_id_to_name, get_full_group_member_list
+from app.line_client import (
+    send_line_reply, get_mentions_with_amounts, get_real_mentions,
+    resolve_id_to_name, get_full_group_member_list, fetch_all_group_member_ids,
+)
 from app.categorize import resolve_category
 
 def get_group_member_list(group_id: str) -> list:
     """取得群組完整成員清單（優先呼叫LINE官方API拿真實全體成員，
     非僅限機器人互動過的人；API打不通則自動退回互動快取名單）"""
     return get_full_group_member_list(group_id)
+
+FETCH_MEMBERS_KEYWORDS = ["抓取成員", "更新成員", "同步成員"]
+
+def try_handle_fetch_members_command(group_id: str, event, clean_text: str, reply_token: str) -> bool:
+    """手動觸發抓取群組成員名單。
+    1) 先嘗試 LINE 官方「取得群組成員ID清單」API，成功就直接列出抓到的人並寫入資料庫。
+    2) 官方 API 抓不到（權限限制等）時，改看這則訊息裡有沒有 @tag 成員，
+       有的話就用標記到的人登記進資料庫；沒有的話，引導使用者改用 @tag 方式重新輸入。
+    """
+    if not any(kw in clean_text for kw in FETCH_MEMBERS_KEYWORDS):
+        return False
+
+    member_ids = fetch_all_group_member_ids(group_id)
+    if member_ids:
+        names = [resolve_id_to_name(group_id, uid) for uid in member_ids]
+        lines = "\n".join(f"・{n}" for n in names)
+        send_line_reply(
+            reply_token,
+            f"✅ 已透過 LINE 官方 API 抓取到 {len(names)} 位成員，並更新到資料庫：\n{lines}"
+        )
+        return True
+
+    tagged_ids = get_real_mentions(event)
+    if tagged_ids:
+        names = [resolve_id_to_name(group_id, uid) for uid in tagged_ids]
+        lines = "\n".join(f"・{n}" for n in names)
+        send_line_reply(
+            reply_token,
+            f"⚠️ LINE 官方 API 目前無法使用（可能是帳號權限限制），已改用您標記的成員登記（共 {len(names)} 位）：\n{lines}\n"
+            f"👉 之後有新成員加入，記得再標記一次補登，或整個群組重新標記一遍即可更新。"
+        )
+        return True
+
+    send_line_reply(
+        reply_token,
+        "⚠️ 目前無法透過 LINE 官方 API 取得完整群組成員清單（可能是帳號權限限制）。\n"
+        "請改用 @tag 方式提供成員名單，把想登記的人都標記在同一則訊息裡，例如：\n"
+        "@記帳米粒 抓取成員 @小明 @小華 @小美"
+    )
+    return True
 
 def create_split_order(group_id: str, payer_id: str, payer_name: str, items: list, participants: list) -> str:
     """
