@@ -242,12 +242,22 @@ def handle_text_message(event):
 
             real_tagged_ids = get_real_mentions(event)
 
+            # 🐛 修正：只 tag 一個人時，原本無條件當成「tag到的人=付款人、輸入者=收款人」，
+            # 導致「我給 @墊付人 100」這種輸入者本人才是付款人的句型完全顛倒。
+            # 改成先判斷句子裡的方向詞：「我給／我付／付給／還給」代表輸入者自己是付款人，
+            # 沒有這類詞才維持原本假設（tag到的人是付款人，例如「@小明 已還 100」）。
+            is_creator_paying = any(k in user_text for k in ["我給", "我付", "付給", "還給", "我還給", "我還"])
+
             if len(real_tagged_ids) >= 2:
                 final_payer_id = real_tagged_ids[0]
                 final_receiver_id = real_tagged_ids[1]
             elif len(real_tagged_ids) == 1:
-                final_payer_id = real_tagged_ids[0]
-                final_receiver_id = creator_id
+                if is_creator_paying:
+                    final_payer_id = creator_id
+                    final_receiver_id = real_tagged_ids[0]
+                else:
+                    final_payer_id = real_tagged_ids[0]
+                    final_receiver_id = creator_id
             else:
                 final_payer_id = creator_id
                 final_receiver_id = creator_id
